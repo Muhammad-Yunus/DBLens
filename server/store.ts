@@ -17,7 +17,15 @@ import {
   TARGET_INVENTORY_SCHEMA,
   createSeedOperationalData,
 } from './seedData.ts';
-import { encryptSecret, decryptSecret, hashPassword, verifyPassword, generateToken, hashToken } from './crypto.ts';
+import {
+  encryptSecret,
+  decryptSecret,
+  CredentialDecryptionError,
+  hashPassword,
+  verifyPassword,
+  generateToken,
+  hashToken,
+} from './crypto.ts';
 import type {
   AuthUserDTO,
   WorkspaceDTO,
@@ -795,31 +803,117 @@ export async function getDatasourceWithSecret(
       .where(and(eq(datasources.id, datasourceId), eq(datasources.ownerId, ownerId)));
     const row = rows[0];
     if (!row) return null;
+    try {
+      return {
+        id: row.id,
+        workspaceId: row.workspaceId,
+        name: row.name,
+        host: row.host,
+        port: row.port,
+        databaseName: row.databaseName,
+        username: row.username,
+        password: decryptSecret(row.encryptedPassword),
+        sslMode: (row.sslMode as 'require' | 'prefer' | 'disable') || 'require',
+      };
+    } catch (err) {
+      if (err instanceof CredentialDecryptionError) {
+        await updateDatasourceStatus(datasourceId, {
+          status: 'error',
+          lastError: err.message,
+        });
+      }
+      throw err;
+    }
+  }
+  const found = mem.datasources.find((d) => d.id === datasourceId && d.ownerId === ownerId);
+  if (!found) return null;
+  try {
     return {
-      id: row.id,
-      workspaceId: row.workspaceId,
-      name: row.name,
-      host: row.host,
-      port: row.port,
-      databaseName: row.databaseName,
-      username: row.username,
-      password: decryptSecret(row.encryptedPassword),
-      sslMode: (row.sslMode as 'require' | 'prefer' | 'disable') || 'require',
+      id: found.id,
+      workspaceId: found.workspaceId,
+      name: found.name,
+      host: found.host,
+      port: found.port,
+      databaseName: found.databaseName,
+      username: found.username,
+      password: decryptSecret(found.encryptedPassword),
+      sslMode: found.sslMode,
+    };
+  } catch (err) {
+    if (err instanceof CredentialDecryptionError) {
+      await updateDatasourceStatus(datasourceId, {
+        status: 'error',
+        lastError: err.message,
+      });
+    }
+    throw err;
+  }
+}
+
+export async function getDatasourceMeta(
+  datasourceId: string,
+  ownerId: string,
+): Promise<DatasourceDTO | null> {
+  const db = getDb();
+  if (db) {
+    const rows = await db
+      .select()
+      .from(datasources)
+      .where(and(eq(datasources.id, datasourceId), eq(datasources.ownerId, ownerId)));
+    const d = rows[0];
+    if (!d) return null;
+    return {
+      id: d.id,
+      workspaceId: d.workspaceId,
+      name: d.name,
+      engine: 'postgresql',
+      host: d.host,
+      port: d.port,
+      databaseName: d.databaseName,
+      username: d.username,
+      sslMode: (d.sslMode as 'require' | 'prefer' | 'disable') || 'require',
+      status: (d.status as 'connected' | 'disconnected' | 'error') || 'disconnected',
+      lastError: d.lastError,
+      lastTestedAt: d.lastTestedAt?.toISOString() ?? null,
+      lastIntrospectedAt: d.lastIntrospectedAt?.toISOString() ?? null,
+      createdAt: d.createdAt.toISOString(),
     };
   }
   const found = mem.datasources.find((d) => d.id === datasourceId && d.ownerId === ownerId);
   if (!found) return null;
-  return {
-    id: found.id,
-    workspaceId: found.workspaceId,
-    name: found.name,
-    host: found.host,
-    port: found.port,
-    databaseName: found.databaseName,
-    username: found.username,
-    password: decryptSecret(found.encryptedPassword),
-    sslMode: found.sslMode,
-  };
+  const { ownerId: _o, encryptedPassword: _ep, ...dto } = found;
+  return dto;
+}
+
+export async function updateDatasourcePassword(
+  datasourceId: string,
+  ownerId: string,
+  newPassword: string,
+  status: 'connected' | 'error',
+  lastError: string | null,
+): Promise<void> {
+  const encryptedPassword = encryptSecret(newPassword);
+  const now = new Date();
+  const db = getDb();
+  if (db) {
+    await db
+      .update(datasources)
+      .set({
+        encryptedPassword,
+        status,
+        lastError,
+        lastTestedAt: now,
+      })
+      .where(and(eq(datasources.id, datasourceId), eq(datasources.ownerId, ownerId)));
+    return;
+  }
+  const ds = mem.datasources.find((d) => d.id === datasourceId && d.ownerId === ownerId);
+  if (ds) {
+    ds.encryptedPassword = encryptedPassword;
+    ds.status = status;
+    ds.lastError = lastError;
+    ds.lastTestedAt = now.toISOString();
+  }
 }
 
 export async function updateDatasourceStatus(

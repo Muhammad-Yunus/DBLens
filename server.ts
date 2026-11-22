@@ -20,6 +20,8 @@ import {
   updateSnapshotSchema,
   createDatasource,
   getDatasourceWithSecret,
+  getDatasourceMeta,
+  updateDatasourcePassword,
   updateDatasourceStatus,
   deleteDatasource,
   createMigrationRecord,
@@ -31,8 +33,10 @@ import {
   createTagRecord,
   deleteTagRecord,
 } from './server/store.ts';
+import { CredentialDecryptionError } from './server/crypto.ts';
 import {
   testPostgresConnection,
+  listPostgresSchemas,
   introspectPostgresSchema,
   validateDatasourceHost,
 } from './server/introspect.ts';
@@ -470,6 +474,45 @@ async function startServer(): Promise<void> {
     },
   );
 
+  app.patch(
+    '/api/workspaces/:id/datasources/:dsId',
+    requireAuth,
+    requireWorkspaceOwner,
+    async (req: AuthenticatedRequest, res) => {
+      try {
+        const password = typeof req.body?.password === 'string' ? req.body.password : '';
+        if (!password) {
+          res.status(400).json({ error: 'Password is required to update credentials.' });
+          return;
+        }
+        const meta = await getDatasourceMeta(String(req.params.dsId), req.user!.id);
+        if (!meta) {
+          res.status(404).json({ error: 'Datasource not found' });
+          return;
+        }
+        try {
+          const info = await testPostgresConnection({
+            host: meta.host,
+            port: meta.port,
+            databaseName: meta.databaseName,
+            username: meta.username,
+            password,
+            sslMode: meta.sslMode,
+          });
+          await updateDatasourcePassword(meta.id, req.user!.id, password, 'connected', null);
+          res.json({ ok: true, ...info });
+        } catch (connErr) {
+          const msg = connErr instanceof Error ? connErr.message : 'Connection failed';
+          await updateDatasourcePassword(meta.id, req.user!.id, password, 'error', msg);
+          res.status(400).json({ ok: false, error: msg });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to update datasource';
+        res.status(400).json({ error: msg });
+      }
+    },
+  );
+
   app.post(
     '/api/workspaces/:id/datasources/:dsId/test',
     requireAuth,
@@ -499,7 +542,35 @@ async function startServer(): Promise<void> {
           res.status(400).json({ ok: false, error: msg });
         }
       } catch (err) {
+        if (err instanceof CredentialDecryptionError) {
+          res.status(409).json({ ok: false, code: 'CREDENTIALS_NEED_UPDATE', error: err.message });
+          return;
+        }
         const msg = err instanceof Error ? err.message : 'Test failed';
+        res.status(400).json({ error: msg });
+      }
+    },
+  );
+
+  app.get(
+    '/api/workspaces/:id/datasources/:dsId/schemas',
+    requireAuth,
+    requireWorkspaceOwner,
+    async (req: AuthenticatedRequest, res) => {
+      try {
+        const ds = await getDatasourceWithSecret(String(req.params.dsId), req.user!.id);
+        if (!ds) {
+          res.status(404).json({ error: 'Datasource not found' });
+          return;
+        }
+        const schemas = await listPostgresSchemas(ds);
+        res.json({ schemas });
+      } catch (err) {
+        if (err instanceof CredentialDecryptionError) {
+          res.status(409).json({ ok: false, code: 'CREDENTIALS_NEED_UPDATE', error: err.message });
+          return;
+        }
+        const msg = err instanceof Error ? err.message : 'Failed to list schemas';
         res.status(400).json({ error: msg });
       }
     },
@@ -516,7 +587,10 @@ async function startServer(): Promise<void> {
           res.status(404).json({ error: 'Datasource not found' });
           return;
         }
-        const graph = await introspectPostgresSchema(ds);
+        const schemas = Array.isArray(req.body?.schemas)
+          ? req.body.schemas.map(String).filter((s: string) => s.trim().length > 0)
+          : undefined;
+        const graph = await introspectPostgresSchema(ds, { schemas });
         await updateDatasourceStatus(ds.id, {
           status: 'connected',
           lastError: null,
@@ -524,11 +598,12 @@ async function startServer(): Promise<void> {
         });
 
         const versionTag = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 12);
+        const schemaSuffix = schemas && schemas.length > 0 ? ` [${schemas.join(', ')}]` : '';
         const snap = await createSnapshot({
           workspaceId: String(req.params.id),
           datasourceId: ds.id,
           versionTag,
-          label: `${ds.name} (${versionTag})`,
+          label: `${ds.name}${schemaSuffix} (${versionTag})`,
           schemaJson: graph,
         });
         await updateWorkspaceMeta(String(req.params.id), { activeSnapshotId: snap.id });
@@ -539,7 +614,7 @@ async function startServer(): Promise<void> {
           commitSha: versionTag.slice(-7),
           author: req.user!.name,
           status: 'passed',
-          summary: `Introspected ${graph.nodes.length} tables/views from ${ds.name}`,
+          summary: `Introspected ${graph.nodes.length} tables/views from ${ds.name}${schemaSuffix}`,
           diffCount: graph.nodes.length,
           durationMs: 420,
           checks: [
@@ -553,6 +628,10 @@ async function startServer(): Promise<void> {
 
         res.json({ snapshot: snap, objectCount: graph.nodes.length });
       } catch (err) {
+        if (err instanceof CredentialDecryptionError) {
+          res.status(409).json({ ok: false, code: 'CREDENTIALS_NEED_UPDATE', error: err.message });
+          return;
+        }
         const msg = err instanceof Error ? err.message : 'Introspection failed';
         res.status(400).json({ error: msg });
       }

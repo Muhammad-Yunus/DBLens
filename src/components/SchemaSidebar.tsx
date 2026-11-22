@@ -30,6 +30,9 @@ interface SchemaSidebarProps {
   diff: ComputedDiff;
   selectedNodeId: string | null;
   onSelectNode: (nodeId: string) => void;
+  availableSchemas: { schema: string; count: number }[];
+  schemaFilter: string;
+  onChangeSchemaFilter: (schema: string) => void;
 }
 
 export const SchemaSidebar: React.FC<SchemaSidebarProps> = ({
@@ -45,6 +48,9 @@ export const SchemaSidebar: React.FC<SchemaSidebarProps> = ({
   diff,
   selectedNodeId,
   onSelectNode,
+  availableSchemas,
+  schemaFilter,
+  onChangeSchemaFilter,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [snapshotMenuOpen, setSnapshotMenuOpen] = useState(false);
@@ -104,17 +110,26 @@ export const SchemaSidebar: React.FC<SchemaSidebarProps> = ({
     );
   };
 
-  // Match mockup order: Products primary under Tables, other tables like regions either under Tables or secondary group
+  const isDemoInventory = tableNodes.some((n) => n.id === 'tbl_products');
   const primaryTables = tableNodes.filter((n) => {
     const matches = filterNode(
       n.name,
       n.columns.map((c) => c.name),
     );
-    return matches && (n.name === 'Products' || tableNodes.length > 2 || query.length > 0);
+    if (!matches) return false;
+    if (isDemoInventory && !query) {
+      return n.id === 'tbl_products';
+    }
+    return true;
   });
 
   const secondaryTables = tableNodes.filter(
-    (n) => !primaryTables.some((p) => p.id === n.id) && filterNode(n.name, n.columns.map((c) => c.name)),
+    (n) =>
+      !primaryTables.some((p) => p.id === n.id) &&
+      filterNode(
+        n.name,
+        n.columns.map((c) => c.name),
+      ),
   );
 
   const visibleViews = viewNodes.filter((n) =>
@@ -246,6 +261,26 @@ export const SchemaSidebar: React.FC<SchemaSidebarProps> = ({
             /
           </span>
         </div>
+
+        {availableSchemas.length > 1 && (
+          <div className="mt-2">
+            <select
+              value={schemaFilter}
+              onChange={(e) => onChangeSchemaFilter(e.target.value)}
+              aria-label="Filter by PostgreSQL schema"
+              className="w-full h-7 px-2 text-[11.5px] font-medium border border-[#E5E7EB] rounded-[6px] bg-[#F9FAFB] text-[#374151]"
+            >
+              <option value="ALL">
+                All Schemas ({availableSchemas.reduce((acc, s) => acc + s.count, 0)})
+              </option>
+              {availableSchemas.map((s) => (
+                <option key={s.schema} value={s.schema}>
+                  {s.schema} ({s.count})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
       </div>
 
       {/* Schema Tree */}

@@ -16,7 +16,9 @@ import {
   Save,
   Trash2,
   X,
+  LayoutGrid,
 } from 'lucide-react';
+import { computeAutoLayout, ERD_CARD_WIDTH, estimateCardHeight } from '../utils/autoLayout.ts';
 import type {
   SchemaGraph,
   SchemaTableNode,
@@ -40,6 +42,60 @@ interface ErdCanvasProps {
 
 type CardSubTab = 'columns' | 'create' | 'dependencies' | 'indexes';
 
+interface ComputedEdge {
+  rel: SchemaRelation;
+  source: SchemaTableNode;
+  target: SchemaTableNode;
+  pathD: string;
+  midX: number;
+  midY: number;
+  isHighlighted: boolean;
+}
+
+function getColumnAnchorY(
+  node: SchemaTableNode,
+  colName: string | undefined,
+  subTab: CardSubTab,
+): number {
+  if (subTab !== 'columns' || !colName) {
+    return node.position.y + 132;
+  }
+  const idx = node.columns.findIndex(
+    (c) => c.name.toLowerCase() === colName.toLowerCase(),
+  );
+  if (idx === -1) {
+    return node.position.y + 132;
+  }
+  // Top accent (2) + header (~46) + tab bar (~31) + col-header (~32) = 111px, row height ~33px
+  return node.position.y + 111 + idx * 33 + 16;
+}
+
+function cubicPointAtMid(
+  x1: number,
+  y1: number,
+  cx1: number,
+  cy1: number,
+  cx2: number,
+  cy2: number,
+  x2: number,
+  y2: number,
+): { x: number; y: number } {
+  const t = 0.5;
+  const mt = 1 - t;
+  return {
+    x:
+      mt * mt * mt * x1 +
+      3 * mt * mt * t * cx1 +
+      3 * mt * t * t * cx2 +
+      t * t * t * x2,
+    y:
+      mt * mt * mt * y1 +
+      3 * mt * mt * t * cy1 +
+      3 * mt * t * t * cy2 +
+      t * t * t * y2,
+  };
+}
+
 export const ErdCanvas: React.FC<ErdCanvasProps> = ({
   graph,
   diff,
@@ -60,16 +116,25 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
   const [showAllNodes, setShowAllNodes] = useState(false);
   const [cardTabs, setCardTabs] = useState<Record<string, CardSubTab>>({});
   const [activeRelationId, setActiveRelationId] = useState<string | null>(null);
+  const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
 
-  // Dragging state
+  // Dragging state & stable refs to avoid listener teardown on every frame
   const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
   const [panning, setPanning] = useState(false);
+  const graphRef = useRef(graph);
+  graphRef.current = graph;
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const onUpdateGraphRef = useRef(onUpdateGraph);
+  onUpdateGraphRef.current = onUpdateGraph;
+
   const dragStartRef = useRef<{
     mouseX: number;
     mouseY: number;
     origX: number;
     origY: number;
-  }>({ mouseX: 0, mouseY: 0, origX: 0, origY: 0 });
+    hasMoved: boolean;
+  }>({ mouseX: 0, mouseY: 0, origX: 0, origY: 0, hasMoved: false });
 
   const visibleNodes = graph.nodes.filter(
     (n) => showAllNodes || n.visibleOnCanvas !== false || n.id === selectedNodeId,
@@ -81,15 +146,18 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
     const rect = container.getBoundingClientRect();
     const minX = Math.min(...visibleNodes.map((n) => n.position.x));
     const minY = Math.min(...visibleNodes.map((n) => n.position.y));
-    const maxX = Math.max(...visibleNodes.map((n) => n.position.x + 330));
-    const maxY = Math.max(...visibleNodes.map((n) => n.position.y + 220));
+    const maxX = Math.max(...visibleNodes.map((n) => n.position.x + ERD_CARD_WIDTH));
+    const maxY = Math.max(...visibleNodes.map((n) => n.position.y + estimateCardHeight(n)));
     const contentW = Math.max(360, maxX - minX);
     const contentH = Math.max(240, maxY - minY);
 
-    const padding = rect.width < 640 ? 32 : 80;
+    const padding = rect.width < 640 ? 40 : 100;
     const nextZoom = Math.min(
       1.05,
-      Math.max(0.52, Math.min((rect.width - padding) / contentW, (rect.height - padding) / contentH)),
+      Math.max(
+        0.35,
+        Math.min((rect.width - padding) / contentW, (rect.height - padding) / contentH),
+      ),
     );
     const centeredX = (rect.width - contentW * nextZoom) / 2 - minX * nextZoom;
     const centeredY = (rect.height - contentH * nextZoom) / 2 - minY * nextZoom;
@@ -97,14 +165,14 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
     setPan({ x: Math.round(centeredX), y: Math.round(centeredY) });
   }, [visibleNodes]);
 
-  // Fit cleanly on initial mount and viewport resize
+  const nodeSignature = graph.nodes.map((n) => n.id).join('|');
   useEffect(() => {
     const timer = setTimeout(() => {
       fitToView();
-    }, 30);
+    }, 40);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showAllNodes, graph.nodes.length]);
+  }, [showAllNodes, nodeSignature]);
 
   useEffect(() => {
     const onResize = () => fitToView();
@@ -114,6 +182,7 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
 
   const handleBackgroundPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.target !== e.currentTarget && !(e.target as HTMLElement).dataset.canvasBg) return;
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
     setActiveRelationId(null);
     onSelectNode(null);
     setPanning(true);
@@ -122,11 +191,28 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
       mouseY: e.clientY,
       origX: pan.x,
       origY: pan.y,
+      hasMoved: false,
     };
   };
 
-  const handleNodeDragStart = (e: React.PointerEvent, node: SchemaTableNode) => {
+  const handleNodeDragStart = (
+    e: React.PointerEvent,
+    node: SchemaTableNode,
+    allowInteractiveBypass = false,
+  ) => {
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    if (!allowInteractiveBypass) {
+      const interactive = (e.target as HTMLElement).closest(
+        'button, a, input, select, textarea, pre',
+      );
+      if (interactive) {
+        e.stopPropagation();
+        onSelectNode(node.id);
+        return;
+      }
+    }
     e.stopPropagation();
+    setActiveRelationId(null);
     onSelectNode(node.id);
     setDraggingNodeId(node.id);
     dragStartRef.current = {
@@ -134,6 +220,7 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
       mouseY: e.clientY,
       origX: node.position.x,
       origY: node.position.y,
+      hasMoved: false,
     };
   };
 
@@ -144,24 +231,30 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
       const dx = e.clientX - dragStartRef.current.mouseX;
       const dy = e.clientY - dragStartRef.current.mouseY;
 
+      if (!dragStartRef.current.hasMoved && Math.abs(dx) < 3 && Math.abs(dy) < 3) {
+        return;
+      }
+      dragStartRef.current.hasMoved = true;
+
       if (panning) {
         setPan({
           x: dragStartRef.current.origX + dx,
           y: dragStartRef.current.origY + dy,
         });
       } else if (draggingNodeId) {
-        const nextNodes = graph.nodes.map((n) =>
+        const currentGraph = graphRef.current;
+        const currentZoom = zoomRef.current || 1;
+        const nextX = Math.round(dragStartRef.current.origX + dx / currentZoom);
+        const nextY = Math.round(dragStartRef.current.origY + dy / currentZoom);
+        const nextNodes = currentGraph.nodes.map((n) =>
           n.id === draggingNodeId
             ? {
                 ...n,
-                position: {
-                  x: Math.round(dragStartRef.current.origX + dx / zoom),
-                  y: Math.round(dragStartRef.current.origY + dy / zoom),
-                },
+                position: { x: nextX, y: nextY },
               }
             : n,
         );
-        onUpdateGraph({ ...graph, nodes: nextNodes });
+        onUpdateGraphRef.current({ ...currentGraph, nodes: nextNodes });
       }
     };
 
@@ -172,17 +265,19 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
 
     window.addEventListener('pointermove', handleMove);
     window.addEventListener('pointerup', handleUp);
+    window.addEventListener('pointercancel', handleUp);
     return () => {
       window.removeEventListener('pointermove', handleMove);
       window.removeEventListener('pointerup', handleUp);
+      window.removeEventListener('pointercancel', handleUp);
     };
-  }, [draggingNodeId, panning, zoom, graph, onUpdateGraph]);
+  }, [draggingNodeId, panning]);
 
   const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
     if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
       const delta = e.deltaY > 0 ? -0.08 : 0.08;
-      setZoom((z) => Math.min(1.8, Math.max(0.4, Number((z + delta).toFixed(2)))));
+      setZoom((z) => Math.min(1.8, Math.max(0.3, Number((z + delta).toFixed(2)))));
     }
   };
 
@@ -198,6 +293,12 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
     }
   };
 
+  const handleAutoLayout = () => {
+    const arranged = computeAutoLayout(graph);
+    onUpdateGraph(arranged);
+    setTimeout(() => fitToView(), 50);
+  };
+
   const deleteRelation = (relId: string) => {
     onUpdateGraph({
       ...graph,
@@ -206,13 +307,76 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
     setActiveRelationId(null);
   };
 
-  const getNodeWidth = () => 332;
-  const getNodeAnchorY = (node: SchemaTableNode) => node.position.y + 132;
-
   const visibleNodeIds = new Set(visibleNodes.map((n) => n.id));
   const visibleRelations = graph.relations.filter(
     (r) => visibleNodeIds.has(r.sourceId) && visibleNodeIds.has(r.targetId),
   );
+
+  const focusNodeId = hoveredNodeId || selectedNodeId;
+
+  const computedEdges: ComputedEdge[] = visibleRelations
+    .map((rel): ComputedEdge | null => {
+      const source = visibleNodes.find((n) => n.id === rel.sourceId);
+      const target = visibleNodes.find((n) => n.id === rel.targetId);
+      if (!source || !target) return null;
+
+      const srcTab: CardSubTab = cardTabs[source.id] || 'columns';
+      const tgtTab: CardSubTab = cardTabs[target.id] || 'columns';
+      const y1 = getColumnAnchorY(source, rel.sourceColumn, srcTab);
+      const y2 = getColumnAnchorY(target, rel.targetColumn, tgtTab);
+
+      let x1: number;
+      let x2: number;
+      let cx1: number;
+      let cx2: number;
+
+      if (source.id === target.id) {
+        // Self-referential FK loop on right edge
+        x1 = source.position.x + ERD_CARD_WIDTH;
+        x2 = source.position.x + ERD_CARD_WIDTH + 3;
+        cx1 = x1 + 78;
+        cx2 = x2 + 78;
+      } else if (target.position.x >= source.position.x + ERD_CARD_WIDTH + 24) {
+        // Target is cleanly to the right
+        x1 = source.position.x + ERD_CARD_WIDTH;
+        x2 = target.position.x - 3;
+        const dx = Math.max(48, (x2 - x1) * 0.45);
+        cx1 = x1 + dx;
+        cx2 = x2 - dx;
+      } else if (source.position.x >= target.position.x + ERD_CARD_WIDTH + 24) {
+        // Target is cleanly to the left
+        x1 = source.position.x;
+        x2 = target.position.x + ERD_CARD_WIDTH + 3;
+        const dx = Math.max(48, (x1 - x2) * 0.45);
+        cx1 = x1 - dx;
+        cx2 = x2 + dx;
+      } else {
+        // Stacked vertically / overlapping X: route cleanly along the right corridor
+        x1 = source.position.x + ERD_CARD_WIDTH;
+        x2 = target.position.x + ERD_CARD_WIDTH + 3;
+        const rightEdge = Math.max(x1, x2) + 84;
+        cx1 = rightEdge;
+        cx2 = rightEdge;
+      }
+
+      const pathD = `M ${x1} ${y1} C ${cx1} ${y1}, ${cx2} ${y2}, ${x2} ${y2}`;
+      const mid = cubicPointAtMid(x1, y1, cx1, y1, cx2, y2, x2, y2);
+      const isHighlighted =
+        activeRelationId === rel.id ||
+        focusNodeId === source.id ||
+        focusNodeId === target.id;
+
+      return {
+        rel,
+        source,
+        target,
+        pathD,
+        midX: mid.x,
+        midY: mid.y,
+        isHighlighted,
+      };
+    })
+    .filter((e): e is ComputedEdge => e !== null);
 
   return (
     <div
@@ -220,18 +384,18 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
       onPointerDown={handleBackgroundPointerDown}
       onWheel={handleWheel}
       data-canvas-bg="true"
-      className={`relative flex-1 overflow-hidden erd-dot-grid select-none ${
-        panning ? 'cursor-grabbing' : 'cursor-grab'
+      className={`relative flex-1 overflow-hidden erd-dot-grid select-none touch-none ${
+        draggingNodeId ? 'cursor-grabbing' : panning ? 'cursor-grabbing' : 'cursor-grab'
       } ${isFullscreen ? 'fixed inset-0 z-50' : ''}`}
     >
-      {/* Top-Right Zoom & Canvas Controls (Exact mockup 4-button toolbar) */}
+      {/* Top-Right Zoom & Canvas Controls */}
       <div
         onPointerDown={(e) => e.stopPropagation()}
         className="absolute top-4 right-4 sm:right-5 z-20 bg-white border border-[#E5E7EB] rounded-[7px] shadow-[0_1px_2px_rgba(0,0,0,0.04)] flex items-center divide-x divide-[#E5E7EB]"
       >
         <button
           type="button"
-          onClick={() => setZoom((z) => Math.max(0.4, Number((z - 0.1).toFixed(2))))}
+          onClick={() => setZoom((z) => Math.max(0.3, Number((z - 0.1).toFixed(2))))}
           title="Zoom out"
           aria-label="Zoom out"
           className="w-8 h-8 flex items-center justify-center text-[#374151] hover:bg-[#F9FAFB] rounded-l-[7px] transition-colors cursor-pointer"
@@ -271,7 +435,7 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
         </button>
       </div>
 
-      {/* Bottom-Left Minimal ERD Builder Bar */}
+      {/* Bottom-Left ERD Builder Bar */}
       <div
         onPointerDown={(e) => e.stopPropagation()}
         className="absolute bottom-4 left-4 z-20 bg-white border border-[#E5E7EB] rounded-[7px] shadow-[0_1px_2px_rgba(0,0,0,0.04)] flex items-center divide-x divide-[#E5E7EB] text-[12px] font-medium text-[#374151] max-w-[calc(100vw-2rem)] overflow-x-auto no-scrollbar"
@@ -302,13 +466,24 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
         </button>
         <button
           type="button"
+          onClick={handleAutoLayout}
+          title="Arrange tables cleanly without overlap"
+          className="px-2.5 h-8 flex items-center gap-1.5 hover:bg-[#F9FAFB] whitespace-nowrap shrink-0 cursor-pointer"
+        >
+          <LayoutGrid className="w-3.5 h-3.5 text-[#6B7280]" />
+          <span>Auto Layout</span>
+        </button>
+        <button
+          type="button"
           onClick={() => setShowAllNodes((v) => !v)}
           className={`px-2.5 h-8 flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
             showAllNodes ? 'bg-[#F3F4F6] text-[#111827]' : 'hover:bg-[#F9FAFB]'
           }`}
         >
           <Layers className="w-3.5 h-3.5 text-[#6B7280]" />
-          <span>{showAllNodes ? `Focus (${visibleNodes.length})` : `All (${graph.nodes.length})`}</span>
+          <span>
+            {showAllNodes ? `Focus (${visibleNodes.length})` : `All (${graph.nodes.length})`}
+          </span>
         </button>
         {hasUnsavedEdits && (
           <button
@@ -333,7 +508,7 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
       >
         {/* SVG Edges Layer */}
         <svg
-          className="overflow-visible absolute top-0 left-0 w-[4000px] h-[4000px] pointer-events-none"
+          className="overflow-visible absolute top-0 left-0 w-[1px] h-[1px] pointer-events-none"
           aria-hidden="true"
         >
           <defs>
@@ -348,69 +523,52 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
             >
               <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#9CA3AF" />
             </marker>
+            <marker
+              id="erd-arrow-active"
+              viewBox="0 0 10 10"
+              refX="8"
+              refY="5"
+              markerWidth="6"
+              markerHeight="6"
+              orient="auto-start-reverse"
+            >
+              <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#2563EB" />
+            </marker>
           </defs>
 
-          {visibleRelations.map((rel: SchemaRelation) => {
-            const source = visibleNodes.find((n) => n.id === rel.sourceId);
-            const target = visibleNodes.find((n) => n.id === rel.targetId);
-            if (!source || !target) return null;
-
-            const srcW = getNodeWidth();
-            const srcRight = source.position.x + srcW;
-            const tgtLeft = target.position.x;
-            const leftToRight = srcRight <= tgtLeft + 20;
-
-            const x1 = leftToRight ? srcRight : source.position.x;
-            const x2 = leftToRight ? tgtLeft - 2 : target.position.x + srcW + 2;
-            const y1 = getNodeAnchorY(source);
-            const y2 = getNodeAnchorY(target);
-
-            const dx = Math.max(40, Math.abs(x2 - x1) * 0.45);
-            const c1x = leftToRight ? x1 + dx : x1 - dx;
-            const c2x = leftToRight ? x2 - dx : x2 + dx;
-            const pathD = `M ${x1} ${y1} C ${c1x} ${y1}, ${c2x} ${y2}, ${x2} ${y2}`;
-
-            return (
-              <path
-                key={rel.id}
-                d={pathD}
-                fill="none"
-                stroke="#9CA3AF"
-                strokeWidth={1.3}
-                markerEnd="url(#erd-arrow)"
-              />
-            );
-          })}
+          {computedEdges.map((edge) => (
+            <path
+              key={edge.rel.id}
+              d={edge.pathD}
+              fill="none"
+              stroke={edge.isHighlighted ? '#2563EB' : '#9CA3AF'}
+              strokeWidth={edge.isHighlighted ? 1.85 : 1.3}
+              strokeDasharray={edge.rel.kind === 'view_dep' && edge.isHighlighted ? '5 3' : undefined}
+              markerEnd={edge.isHighlighted ? 'url(#erd-arrow-active)' : 'url(#erd-arrow)'}
+            />
+          ))}
         </svg>
 
         {/* Midpoint (...) Edge Pills */}
-        {visibleRelations.map((rel) => {
-          const source = visibleNodes.find((n) => n.id === rel.sourceId);
-          const target = visibleNodes.find((n) => n.id === rel.targetId);
-          if (!source || !target) return null;
-
-          const srcW = getNodeWidth();
-          const leftToRight = source.position.x + srcW <= target.position.x + 20;
-          const x1 = leftToRight ? source.position.x + srcW : source.position.x;
-          const x2 = leftToRight ? target.position.x : target.position.x + srcW;
-          const y1 = getNodeAnchorY(source);
-          const y2 = getNodeAnchorY(target);
-          const midX = (x1 + x2) / 2;
-          const midY = (y1 + y2) / 2;
-          const isOpen = activeRelationId === rel.id;
+        {computedEdges.map((edge) => {
+          const isOpen = activeRelationId === edge.rel.id;
 
           return (
             <div
-              key={`pill_${rel.id}`}
-              style={{ left: midX, top: midY }}
+              key={`pill_${edge.rel.id}`}
+              style={{ left: edge.midX, top: edge.midY }}
               onPointerDown={(e) => e.stopPropagation()}
               className="absolute -translate-x-1/2 -translate-y-1/2 pointer-events-auto z-10"
             >
               <button
                 type="button"
-                onClick={() => setActiveRelationId(isOpen ? null : rel.id)}
-                title={rel.label || 'View relationship'}
-                className="w-6 h-6 rounded-full bg-white border border-[#D1D5DB] hover:border-[#6B7280] shadow-xs flex items-center justify-center text-[#6B7280] hover:text-[#111827] transition-colors cursor-pointer"
+                onClick={() => setActiveRelationId(isOpen ? null : edge.rel.id)}
+                title={edge.rel.label || 'View relationship'}
+                className={`w-6 h-6 rounded-full bg-white border shadow-xs flex items-center justify-center transition-colors cursor-pointer ${
+                  edge.isHighlighted
+                    ? 'border-[#2563EB] text-[#2563EB]'
+                    : 'border-[#D1D5DB] hover:border-[#6B7280] text-[#6B7280] hover:text-[#111827]'
+                }`}
               >
                 <MoreHorizontal className="w-3.5 h-3.5" />
               </button>
@@ -419,7 +577,7 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
                 <div className="absolute left-1/2 -translate-x-1/2 top-8 w-64 bg-white border border-[#E5E7EB] rounded-lg shadow-lg p-3 z-30 text-left">
                   <div className="flex items-center justify-between mb-1.5">
                     <span className="text-[11px] font-semibold uppercase tracking-wider text-[#6B7280]">
-                      {rel.kind === 'view_dep' ? 'View Dependency' : 'Foreign Key'}
+                      {edge.rel.kind === 'view_dep' ? 'View Dependency' : 'Foreign Key'}
                     </span>
                     <button
                       type="button"
@@ -430,14 +588,15 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
                     </button>
                   </div>
                   <p className="text-[12px] text-[#111827] font-mono break-all">
-                    {source.name}.{rel.sourceColumn || '*'} → {target.name}.{rel.targetColumn || '*'}
+                    {edge.source.name}.{edge.rel.sourceColumn || '*'} → {edge.target.name}.
+                    {edge.rel.targetColumn || '*'}
                   </p>
-                  {rel.label && (
-                    <p className="text-[11.5px] text-[#6B7280] mt-1">{rel.label}</p>
+                  {edge.rel.label && (
+                    <p className="text-[11.5px] text-[#6B7280] mt-1">{edge.rel.label}</p>
                   )}
                   <button
                     type="button"
-                    onClick={() => deleteRelation(rel.id)}
+                    onClick={() => deleteRelation(edge.rel.id)}
                     className="mt-2.5 w-full py-1 px-2 rounded border border-[#FECACA] text-[#DC2626] hover:bg-[#FEF2F2] text-[11.5px] font-medium flex items-center justify-center gap-1 cursor-pointer"
                   >
                     <Trash2 className="w-3 h-3" />
@@ -458,20 +617,29 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
           const topBorderColor =
             node.kind === 'view' ? 'border-t-[#1F2937]' : 'border-t-[#1D4ED8]';
 
+          const isDraggingThis = draggingNodeId === node.id;
+
           return (
             <div
               key={node.id}
-              style={{ left: node.position.x, top: node.position.y, width: 332 }}
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                onSelectNode(node.id);
-              }}
-              className={`absolute pointer-events-auto bg-white rounded-[10px] border border-[#E2E8F0] border-t-2 ${topBorderColor} shadow-[0_4px_16px_-2px_rgba(15,23,42,0.06)] transition-shadow ${
-                isSelected ? 'ring-2 ring-[#2563EB]/20' : ''
+              style={{ left: node.position.x, top: node.position.y, width: ERD_CARD_WIDTH }}
+              onMouseEnter={() => setHoveredNodeId(node.id)}
+              onMouseLeave={() => setHoveredNodeId((prev) => (prev === node.id ? null : prev))}
+              onPointerDown={(e) => handleNodeDragStart(e, node)}
+              className={`absolute pointer-events-auto touch-none bg-white rounded-[10px] border border-[#E2E8F0] border-t-2 ${topBorderColor} ${
+                isDraggingThis
+                  ? 'shadow-[0_14px_30px_-4px_rgba(15,23,42,0.16)] ring-2 ring-[#2563EB]/30 z-30 cursor-grabbing'
+                  : isSelected
+                    ? 'shadow-[0_4px_16px_-2px_rgba(15,23,42,0.06)] ring-2 ring-[#2563EB]/25 z-10'
+                    : 'shadow-[0_4px_16px_-2px_rgba(15,23,42,0.06)]'
               }`}
             >
-              {/* Node Header */}
-              <div className="px-4 pt-3.5 pb-2.5 flex items-center justify-between gap-2">
+              {/* Node Header (full header is draggable) */}
+              <div
+                className={`px-4 pt-3.5 pb-2.5 flex items-center justify-between gap-2 ${
+                  isDraggingThis ? 'cursor-grabbing' : 'cursor-grab'
+                }`}
+              >
                 <div className="flex items-center gap-2 min-w-0">
                   {node.kind === 'view' ? (
                     <Eye className="w-4 h-4 text-[#374151] shrink-0" strokeWidth={1.75} />
@@ -479,7 +647,9 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
                     <Table2 className="w-4 h-4 text-[#374151] shrink-0" strokeWidth={1.75} />
                   )}
                   <span className="text-[13.5px] font-semibold text-[#111827] truncate">
-                    {node.name}
+                    {node.schema && node.schema !== 'public'
+                      ? `${node.schema}.${node.name}`
+                      : node.name}
                   </span>
                   {node.kind === 'view' && (
                     <span className="px-1.5 py-0.5 rounded-[4px] bg-[#F3F4F6] text-[#4B5563] text-[10px] font-semibold tracking-wider uppercase shrink-0">
@@ -507,7 +677,7 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
                   </button>
                   <button
                     type="button"
-                    onPointerDown={(e) => handleNodeDragStart(e, node)}
+                    onPointerDown={(e) => handleNodeDragStart(e, node, true)}
                     title="Drag card"
                     aria-label={`Drag ${node.name}`}
                     className="p-1 rounded hover:bg-[#F3F4F6] text-[#6B7280] hover:text-[#111827] cursor-grab active:cursor-grabbing"
@@ -587,9 +757,14 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
                         ? diff.columnsByTable[node.id]?.[col.name]
                         : undefined;
                       const isColAdded = colChange === 'added' && nodeDiff?.change !== 'added';
+                      const fkTooltip = col.references
+                        ? `FK → ${col.references.table}.${col.references.column}`
+                        : undefined;
+
                       return (
                         <div
                           key={col.name}
+                          title={fkTooltip}
                           className={`grid grid-cols-[1.25fr_1.15fr_36px] gap-2 items-center py-1.5 text-[12px] rounded px-1 -mx-1 ${
                             isColAdded ? 'bg-[#ECFDF5]' : ''
                           }`}
@@ -611,6 +786,12 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
                                 strokeWidth={2}
                               />
                             )}
+                            {!col.isPrimaryKey && col.isForeignKey && (
+                              <KeyRound
+                                className="w-3.5 h-3.5 text-[#6B7280] shrink-0"
+                                strokeWidth={1.8}
+                              />
+                            )}
                           </div>
                           <div>
                             <span className="inline-block px-2 py-0.5 rounded-[5px] bg-[#F3F4F6] text-[#374151] font-mono text-[11px] whitespace-nowrap">
@@ -629,7 +810,7 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
 
               {activeSubTab === 'create' && (
                 <div className="p-3">
-                  <pre className="p-2.5 rounded-md bg-[#F9FAFB] border border-[#E5E7EB] font-mono text-[11px] text-[#1F2937] overflow-x-auto whitespace-pre-wrap leading-relaxed">
+                  <pre className="p-2.5 rounded-md bg-[#F9FAFB] border border-[#E5E7EB] font-mono text-[11px] text-[#1F2937] overflow-x-auto whitespace-pre-wrap leading-relaxed max-h-56">
                     {node.createStatement ||
                       `CREATE OR REPLACE VIEW "${node.schema}"."${node.name}" AS ...`}
                   </pre>
@@ -643,7 +824,7 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
                   </p>
                   {(node.dependencies && node.dependencies.length > 0
                     ? node.dependencies
-                    : ['public.Products', 'public.regions']
+                    : ['No external dependencies']
                   ).map((dep) => (
                     <div
                       key={dep}
@@ -662,8 +843,8 @@ export const ErdCanvas: React.FC<ErdCanvasProps> = ({
                       key={idx.name}
                       className="flex items-center justify-between text-[12px] py-1 border-b border-[#F3F4F6] last:border-0"
                     >
-                      <span className="font-medium text-[#111827]">{idx.name}</span>
-                      <span className="font-mono text-[11px] text-[#6B7280]">
+                      <span className="font-medium text-[#111827] truncate">{idx.name}</span>
+                      <span className="font-mono text-[11px] text-[#6B7280] shrink-0">
                         ({idx.columns.join(', ')})
                       </span>
                     </div>

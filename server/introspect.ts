@@ -1,5 +1,6 @@
 import pg from 'pg';
 import net from 'node:net';
+import { computeAutoLayout } from '../src/utils/autoLayout.ts';
 import type {
   SchemaGraph,
   SchemaTableNode,
@@ -14,6 +15,33 @@ const BLOCKED_HOSTS = new Set([
   'metadata.goog',
 ]);
 
+// Built-in PostgreSQL & Supabase platform schemas excluded from user-schema introspection by default
+const INTERNAL_SYSTEM_SCHEMAS = [
+  'pg_catalog',
+  'information_schema',
+  'pg_toast',
+  'auth',
+  'storage',
+  'realtime',
+  'vault',
+  'pgsodium',
+  'pgsodium_masks',
+  'pgbouncer',
+  'supabase_functions',
+  'supabase_migrations',
+  'cron',
+  'net',
+  'graphql',
+  'graphql_public',
+  'extensions',
+  '_realtime',
+  '_analytics',
+  '_supavisor',
+  'pgtle',
+  'repack',
+  'topology',
+];
+
 export function validateDatasourceHost(host: string): void {
   const trimmed = host.trim().toLowerCase();
   if (!trimmed || trimmed.length > 253) {
@@ -24,7 +52,6 @@ export function validateDatasourceHost(host: string): void {
   }
   if (net.isIPv4(trimmed)) {
     const parts = trimmed.split('.').map(Number);
-    // Block link-local 169.254.0.0/16
     if (parts[0] === 169 && parts[1] === 254) {
       throw new Error('Link-local addresses are not permitted');
     }
@@ -79,10 +106,50 @@ export async function testPostgresConnection(
   }
 }
 
+export async function listPostgresSchemas(
+  params: PostgresConnectionParams,
+): Promise<{ schema: string; tableCount: number }[]> {
+  const client = new pg.Client(buildClientConfig(params));
+  try {
+    await client.connect();
+    const res = await client.query<{ schema_name: string; table_count: string }>(
+      `
+      SELECT
+        n.nspname AS schema_name,
+        COUNT(c.oid)::text AS table_count
+      FROM pg_catalog.pg_namespace n
+      LEFT JOIN pg_catalog.pg_class c
+        ON c.relnamespace = n.oid
+       AND c.relkind IN ('r', 'p', 'v', 'm')
+      WHERE n.nspname <> ALL($1::text[])
+        AND n.nspname NOT LIKE 'pg_temp_%'
+        AND n.nspname NOT LIKE 'pg_toast_temp_%'
+      GROUP BY n.nspname
+      HAVING COUNT(c.oid) > 0 OR n.nspname = 'public'
+      ORDER BY COUNT(c.oid) DESC, n.nspname ASC
+      `,
+      [INTERNAL_SYSTEM_SCHEMAS],
+    );
+    return res.rows.map((r) => ({
+      schema: r.schema_name,
+      tableCount: Number(r.table_count) || 0,
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 export async function introspectPostgresSchema(
   params: PostgresConnectionParams,
+  options?: { schemas?: string[] },
 ): Promise<SchemaGraph> {
   const client = new pg.Client(buildClientConfig(params));
+  const selectedSchemas =
+    options?.schemas
+      ?.map((s) => s.trim())
+      .filter((s) => s.length > 0) ?? [];
+  const hasFilter = selectedSchemas.length > 0;
+
   try {
     await client.connect();
 
@@ -90,15 +157,36 @@ export async function introspectPostgresSchema(
       table_schema: string;
       table_name: string;
       table_type: string;
-    }>(`
-      SELECT table_schema, table_name, table_type
-      FROM information_schema.tables
-      WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-        AND table_schema NOT LIKE 'pg_temp_%'
-        AND table_schema NOT LIKE 'pg_toast_temp_%'
-      ORDER BY table_schema, table_name
-      LIMIT 60
-    `);
+    }>(
+      hasFilter
+        ? `
+          SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            CASE WHEN c.relkind IN ('v', 'm') THEN 'VIEW' ELSE 'BASE TABLE' END AS table_type
+          FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind IN ('r', 'p', 'v', 'm')
+            AND n.nspname = ANY($1::text[])
+          ORDER BY n.nspname, c.relname
+          LIMIT 200
+        `
+        : `
+          SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            CASE WHEN c.relkind IN ('v', 'm') THEN 'VIEW' ELSE 'BASE TABLE' END AS table_type
+          FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind IN ('r', 'p', 'v', 'm')
+            AND n.nspname <> ALL($1::text[])
+            AND n.nspname NOT LIKE 'pg_temp_%'
+            AND n.nspname NOT LIKE 'pg_toast_temp_%'
+          ORDER BY n.nspname, c.relname
+          LIMIT 200
+        `,
+      [hasFilter ? selectedSchemas : INTERNAL_SYSTEM_SCHEMAS],
+    );
 
     const colsRes = await client.query<{
       table_schema: string;
@@ -111,36 +199,68 @@ export async function introspectPostgresSchema(
       numeric_scale: number | null;
       is_nullable: string;
       column_default: string | null;
-    }>(`
-      SELECT
-        table_schema,
-        table_name,
-        column_name,
-        data_type,
-        udt_name,
-        character_maximum_length,
-        numeric_precision,
-        numeric_scale,
-        is_nullable,
-        column_default
-      FROM information_schema.columns
-      WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-      ORDER BY table_schema, table_name, ordinal_position
-    `);
+    }>(
+      hasFilter
+        ? `
+          SELECT
+            table_schema, table_name, column_name, data_type, udt_name,
+            character_maximum_length, numeric_precision, numeric_scale,
+            is_nullable, column_default
+          FROM information_schema.columns
+          WHERE table_schema = ANY($1::text[])
+          ORDER BY table_schema, table_name, ordinal_position
+        `
+        : `
+          SELECT
+            table_schema, table_name, column_name, data_type, udt_name,
+            character_maximum_length, numeric_precision, numeric_scale,
+            is_nullable, column_default
+          FROM information_schema.columns
+          WHERE table_schema <> ALL($1::text[])
+            AND table_schema NOT LIKE 'pg_temp_%'
+          ORDER BY table_schema, table_name, ordinal_position
+        `,
+      [hasFilter ? selectedSchemas : INTERNAL_SYSTEM_SCHEMAS],
+    );
 
     const pkRes = await client.query<{
       table_schema: string;
       table_name: string;
       column_name: string;
-    }>(`
-      SELECT tc.table_schema, tc.table_name, kcu.column_name
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name
-       AND tc.table_schema = kcu.table_schema
-      WHERE tc.constraint_type = 'PRIMARY KEY'
-        AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
-    `);
+    }>(
+      hasFilter
+        ? `
+          SELECT
+            ns.nspname AS table_schema,
+            cl.relname AS table_name,
+            att.attname AS column_name
+          FROM pg_catalog.pg_constraint con
+          JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid
+          JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace
+          JOIN unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON true
+          JOIN pg_catalog.pg_attribute att
+            ON att.attrelid = con.conrelid
+           AND att.attnum = k.attnum
+          WHERE con.contype = 'p'
+            AND ns.nspname = ANY($1::text[])
+        `
+        : `
+          SELECT
+            ns.nspname AS table_schema,
+            cl.relname AS table_name,
+            att.attname AS column_name
+          FROM pg_catalog.pg_constraint con
+          JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid
+          JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace
+          JOIN unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON true
+          JOIN pg_catalog.pg_attribute att
+            ON att.attrelid = con.conrelid
+           AND att.attnum = k.attnum
+          WHERE con.contype = 'p'
+            AND ns.nspname <> ALL($1::text[])
+        `,
+      [hasFilter ? selectedSchemas : INTERNAL_SYSTEM_SCHEMAS],
+    );
 
     const fkRes = await client.query<{
       constraint_name: string;
@@ -150,46 +270,128 @@ export async function introspectPostgresSchema(
       target_schema: string;
       target_table: string;
       target_column: string;
-    }>(`
-      SELECT
-        tc.constraint_name,
-        tc.table_schema AS source_schema,
-        tc.table_name AS source_table,
-        kcu.column_name AS source_column,
-        ccu.table_schema AS target_schema,
-        ccu.table_name AS target_table,
-        ccu.column_name AS target_column
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name
-       AND tc.table_schema = kcu.table_schema
-      JOIN information_schema.constraint_column_usage ccu
-        ON ccu.constraint_name = tc.constraint_name
-       AND ccu.table_schema = tc.table_schema
-      WHERE tc.constraint_type = 'FOREIGN KEY'
-        AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
-    `);
+    }>(
+      hasFilter
+        ? `
+          SELECT
+            con.conname AS constraint_name,
+            src_ns.nspname AS source_schema,
+            src_cl.relname AS source_table,
+            src_att.attname AS source_column,
+            tgt_ns.nspname AS target_schema,
+            tgt_cl.relname AS target_table,
+            tgt_att.attname AS target_column
+          FROM pg_catalog.pg_constraint con
+          JOIN pg_catalog.pg_class src_cl ON src_cl.oid = con.conrelid
+          JOIN pg_catalog.pg_namespace src_ns ON src_ns.oid = src_cl.relnamespace
+          JOIN pg_catalog.pg_class tgt_cl ON tgt_cl.oid = con.confrelid
+          JOIN pg_catalog.pg_namespace tgt_ns ON tgt_ns.oid = tgt_cl.relnamespace
+          JOIN unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(src_attnum, tgt_attnum, ord) ON true
+          JOIN pg_catalog.pg_attribute src_att
+            ON src_att.attrelid = con.conrelid
+           AND src_att.attnum = cols.src_attnum
+          JOIN pg_catalog.pg_attribute tgt_att
+            ON tgt_att.attrelid = con.confrelid
+           AND tgt_att.attnum = cols.tgt_attnum
+          WHERE con.contype = 'f'
+            AND src_ns.nspname = ANY($1::text[])
+        `
+        : `
+          SELECT
+            con.conname AS constraint_name,
+            src_ns.nspname AS source_schema,
+            src_cl.relname AS source_table,
+            src_att.attname AS source_column,
+            tgt_ns.nspname AS target_schema,
+            tgt_cl.relname AS target_table,
+            tgt_att.attname AS target_column
+          FROM pg_catalog.pg_constraint con
+          JOIN pg_catalog.pg_class src_cl ON src_cl.oid = con.conrelid
+          JOIN pg_catalog.pg_namespace src_ns ON src_ns.oid = src_cl.relnamespace
+          JOIN pg_catalog.pg_class tgt_cl ON tgt_cl.oid = con.confrelid
+          JOIN pg_catalog.pg_namespace tgt_ns ON tgt_ns.oid = tgt_cl.relnamespace
+          JOIN unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(src_attnum, tgt_attnum, ord) ON true
+          JOIN pg_catalog.pg_attribute src_att
+            ON src_att.attrelid = con.conrelid
+           AND src_att.attnum = cols.src_attnum
+          JOIN pg_catalog.pg_attribute tgt_att
+            ON tgt_att.attrelid = con.confrelid
+           AND tgt_att.attnum = cols.tgt_attnum
+          WHERE con.contype = 'f'
+            AND src_ns.nspname <> ALL($1::text[])
+        `,
+      [hasFilter ? selectedSchemas : INTERNAL_SYSTEM_SCHEMAS],
+    );
+
+    const viewDepsRes = await client
+      .query<{
+        view_schema: string;
+        view_name: string;
+        ref_schema: string;
+        ref_name: string;
+      }>(
+        hasFilter
+          ? `
+            SELECT DISTINCT
+              vns.nspname AS view_schema,
+              vc.relname AS view_name,
+              tns.nspname AS ref_schema,
+              tc.relname AS ref_name
+            FROM pg_catalog.pg_depend d
+            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid
+            JOIN pg_catalog.pg_class vc ON vc.oid = rw.ev_class
+            JOIN pg_catalog.pg_namespace vns ON vns.oid = vc.relnamespace
+            JOIN pg_catalog.pg_class tc ON tc.oid = d.refobjid
+            JOIN pg_catalog.pg_namespace tns ON tns.oid = tc.relnamespace
+            WHERE vc.relkind IN ('v', 'm')
+              AND tc.relkind IN ('r', 'p', 'v', 'm')
+              AND vc.oid <> tc.oid
+              AND vns.nspname = ANY($1::text[])
+          `
+          : `
+            SELECT DISTINCT
+              vns.nspname AS view_schema,
+              vc.relname AS view_name,
+              tns.nspname AS ref_schema,
+              tc.relname AS ref_name
+            FROM pg_catalog.pg_depend d
+            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid
+            JOIN pg_catalog.pg_class vc ON vc.oid = rw.ev_class
+            JOIN pg_catalog.pg_namespace vns ON vns.oid = vc.relnamespace
+            JOIN pg_catalog.pg_class tc ON tc.oid = d.refobjid
+            JOIN pg_catalog.pg_namespace tns ON tns.oid = tc.relnamespace
+            WHERE vc.relkind IN ('v', 'm')
+              AND tc.relkind IN ('r', 'p', 'v', 'm')
+              AND vc.oid <> tc.oid
+              AND vns.nspname <> ALL($1::text[])
+              AND tns.nspname <> ALL($1::text[])
+          `,
+        [hasFilter ? selectedSchemas : INTERNAL_SYSTEM_SCHEMAS],
+      )
+      .catch(() => ({ rows: [] }));
 
     const idxRes = await client.query<{
       schemaname: string;
       tablename: string;
       indexname: string;
       indexdef: string;
-    }>(`
-      SELECT schemaname, tablename, indexname, indexdef
-      FROM pg_indexes
-      WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-    `);
+    }>(
+      hasFilter
+        ? `SELECT schemaname, tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = ANY($1::text[])`
+        : `SELECT schemaname, tablename, indexname, indexdef FROM pg_indexes WHERE schemaname <> ALL($1::text[])`,
+      [hasFilter ? selectedSchemas : INTERNAL_SYSTEM_SCHEMAS],
+    );
 
     const viewRes = await client.query<{
       schemaname: string;
       viewname: string;
       definition: string;
-    }>(`
-      SELECT schemaname, viewname, definition
-      FROM pg_views
-      WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-    `);
+    }>(
+      hasFilter
+        ? `SELECT schemaname, viewname, definition FROM pg_views WHERE schemaname = ANY($1::text[])`
+        : `SELECT schemaname, viewname, definition FROM pg_views WHERE schemaname <> ALL($1::text[])`,
+      [hasFilter ? selectedSchemas : INTERNAL_SYSTEM_SCHEMAS],
+    );
 
     const pkSet = new Set(
       pkRes.rows.map((r) => `${r.table_schema}.${r.table_name}.${r.column_name}`),
@@ -210,6 +412,14 @@ export async function introspectPostgresSchema(
       );
     }
 
+    const viewDepsByKey = new Map<string, string[]>();
+    for (const vd of viewDepsRes.rows) {
+      const vKey = `${vd.view_schema}.${vd.view_name}`;
+      const list = viewDepsByKey.get(vKey) ?? [];
+      list.push(`${vd.ref_schema}.${vd.ref_name}`);
+      viewDepsByKey.set(vKey, list);
+    }
+
     const colsByTable = new Map<string, SchemaColumn[]>();
     for (const c of colsRes.rows) {
       const key = `${c.table_schema}.${c.table_name}`;
@@ -220,9 +430,10 @@ export async function introspectPostgresSchema(
           ? `varchar (${c.character_maximum_length})`
           : 'varchar';
       } else if (c.data_type === 'numeric' && c.numeric_precision) {
-        formattedType = c.numeric_scale !== null
-          ? `decimal (${c.numeric_precision}, ${c.numeric_scale})`
-          : `decimal (${c.numeric_precision})`;
+        formattedType =
+          c.numeric_scale !== null
+            ? `decimal (${c.numeric_precision}, ${c.numeric_scale})`
+            : `decimal (${c.numeric_precision})`;
       } else if (c.data_type === 'timestamp with time zone') {
         formattedType = 'timestamptz';
       }
@@ -257,27 +468,21 @@ export async function introspectPostgresSchema(
       });
     }
 
-    const nodes: SchemaTableNode[] = [];
-    tablesRes.rows.forEach((t, i) => {
+    const nodes: SchemaTableNode[] = tablesRes.rows.map((t) => {
       const key = `${t.table_schema}.${t.table_name}`;
       const kind = t.table_type === 'VIEW' ? 'view' : 'table';
-      const colIndex = i % 3;
-      const rowIndex = Math.floor(i / 3);
-      nodes.push({
+      return {
         id: `pg_${t.table_schema}_${t.table_name}`,
         name: t.table_name,
         schema: t.table_schema,
         kind,
-        visibleOnCanvas: i < 8,
-        position: {
-          x: 80 + colIndex * 390,
-          y: 90 + rowIndex * 290,
-        },
+        visibleOnCanvas: true,
+        position: { x: 80, y: 80 },
         columns: colsByTable.get(key) ?? [],
         indexes: idxByTable.get(key) ?? [],
         createStatement: kind === 'view' ? viewDefMap.get(key) : undefined,
-        dependencies: [],
-      });
+        dependencies: viewDepsByKey.get(key) ?? [],
+      };
     });
 
     const nodeIdByKey = new Map(nodes.map((n) => [`${n.schema}.${n.name}`, n.id]));
@@ -287,25 +492,42 @@ export async function introspectPostgresSchema(
     for (const fk of fkRes.rows) {
       const sourceId = nodeIdByKey.get(`${fk.source_schema}.${fk.source_table}`);
       const targetId = nodeIdByKey.get(`${fk.target_schema}.${fk.target_table}`);
-      if (sourceId && targetId && !seenRel.has(fk.constraint_name)) {
-        seenRel.add(fk.constraint_name);
+      const dedupeKey = `${fk.constraint_name}:${fk.source_column}:${fk.target_column}`;
+      if (sourceId && targetId && !seenRel.has(dedupeKey)) {
+        seenRel.add(dedupeKey);
         relations.push({
-          id: `fk_${fk.constraint_name}`,
+          id: `fk_${fk.constraint_name}_${fk.source_column}`,
           sourceId,
           targetId,
           sourceColumn: fk.source_column,
           targetColumn: fk.target_column,
           kind: 'fk',
-          label: `${fk.source_column} -> ${fk.target_table}.${fk.target_column}`,
+          label: `${fk.source_table}.${fk.source_column} → ${fk.target_table}.${fk.target_column}`,
         });
       }
     }
 
-    return {
+    for (const vd of viewDepsRes.rows) {
+      const sourceId = nodeIdByKey.get(`${vd.view_schema}.${vd.view_name}`);
+      const targetId = nodeIdByKey.get(`${vd.ref_schema}.${vd.ref_name}`);
+      const dedupeKey = `vdep:${vd.view_schema}.${vd.view_name}->${vd.ref_schema}.${vd.ref_name}`;
+      if (sourceId && targetId && !seenRel.has(dedupeKey)) {
+        seenRel.add(dedupeKey);
+        relations.push({
+          id: `vdep_${vd.view_name}_${vd.ref_name}`,
+          sourceId,
+          targetId,
+          kind: 'view_dep',
+          label: `View ${vd.view_name} references ${vd.ref_schema}.${vd.ref_name}`,
+        });
+      }
+    }
+
+    return computeAutoLayout({
       dialect: 'postgresql',
       nodes,
       relations,
-    };
+    });
   } finally {
     await client.end().catch(() => undefined);
   }

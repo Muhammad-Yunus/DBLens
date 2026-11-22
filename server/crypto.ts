@@ -2,10 +2,23 @@ import crypto from 'node:crypto';
 
 const FALLBACK_SECRET = crypto.randomBytes(32);
 
+export class CredentialDecryptionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CredentialDecryptionError';
+  }
+}
+
 function getAesKey(): Buffer {
-  const envKey = process.env.DATASOURCE_ENCRYPTION_KEY || process.env.SESSION_SECRET;
-  if (envKey && envKey.trim().length > 0) {
-    return crypto.createHash('sha256').update(envKey).digest();
+  const explicitKey =
+    process.env.DATASOURCE_ENCRYPTION_KEY?.trim() ||
+    process.env.SESSION_SECRET?.trim();
+  if (explicitKey) {
+    return crypto.createHash('sha256').update(explicitKey).digest();
+  }
+  if (process.env.DB_PASSWORD) {
+    const material = `dblens-ds:${process.env.DB_HOST || ''}:${process.env.DB_USER || ''}:${process.env.DB_PASSWORD}`;
+    return crypto.createHash('sha256').update(material).digest();
   }
   return FALLBACK_SECRET;
 }
@@ -46,15 +59,23 @@ export function encryptSecret(plaintext: string): string {
 export function decryptSecret(payload: string): string {
   const parts = payload.split(':');
   if (parts.length !== 3) {
-    throw new Error('Invalid encrypted payload format');
+    throw new CredentialDecryptionError(
+      'Stored datasource credentials are invalid. Please re-enter the password.',
+    );
   }
   const [ivHex, tagHex, dataHex] = parts;
   const key = getAesKey();
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
-  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
-  const decrypted = Buffer.concat([
-    decipher.update(Buffer.from(dataHex, 'hex')),
-    decipher.final(),
-  ]);
-  return decrypted.toString('utf8');
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+    const decrypted = Buffer.concat([
+      decipher.update(Buffer.from(dataHex, 'hex')),
+      decipher.final(),
+    ]);
+    return decrypted.toString('utf8');
+  } catch {
+    throw new CredentialDecryptionError(
+      'Stored datasource password could not be unlocked after a server restart. Please re-enter the password (and optionally set DATASOURCE_ENCRYPTION_KEY in Secrets).',
+    );
+  }
 }

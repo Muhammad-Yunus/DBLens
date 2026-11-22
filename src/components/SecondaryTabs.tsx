@@ -597,7 +597,9 @@ interface SettingsViewProps {
     sslMode: 'require' | 'prefer' | 'disable';
   }) => Promise<void>;
   onTestSavedDatasource: (dsId: string) => Promise<{ ok: boolean; version?: string; latencyMs?: number; error?: string }>;
-  onIntrospectDatasource: (dsId: string) => Promise<void>;
+  onUpdateDatasourcePassword: (dsId: string, password: string) => Promise<{ ok: boolean; error?: string }>;
+  onListDatasourceSchemas: (dsId: string) => Promise<{ schema: string; tableCount: number }[]>;
+  onIntrospectDatasource: (dsId: string, schemas?: string[]) => Promise<void>;
   onDeleteDatasource: (dsId: string) => Promise<void>;
   onRenameWorkspace: (orgSlug: string, name: string) => Promise<void>;
 }
@@ -612,6 +614,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onTestDatasourceDraft,
   onCreateDatasource,
   onTestSavedDatasource,
+  onUpdateDatasourcePassword,
+  onListDatasourceSchemas,
   onIntrospectDatasource,
   onDeleteDatasource,
   onRenameWorkspace,
@@ -628,6 +632,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [saving, setSaving] = useState(false);
   const [bindingPrimary, setBindingPrimary] = useState(false);
   const [introspectingId, setIntrospectingId] = useState<string | null>(null);
+  const [loadingSchemasId, setLoadingSchemasId] = useState<string | null>(null);
+  const [schemasByDs, setSchemasByDs] = useState<
+    Record<string, { schema: string; tableCount: number }[]>
+  >({});
+  const [selectedSchemaByDs, setSelectedSchemaByDs] = useState<Record<string, string>>({});
+  const [unlockingId, setUnlockingId] = useState<string | null>(null);
+  const [unlockPassword, setUnlockPassword] = useState('');
+  const [unlockLoading, setUnlockLoading] = useState(false);
   const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null);
 
   const [orgSlug, setOrgSlug] = useState(workspace.orgSlug);
@@ -945,81 +957,191 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             ) : (
               <div className="divide-y divide-[#F3F4F6] border border-[#E5E7EB] rounded-md">
                 {datasources.map((ds) => (
-                  <div
-                    key={ds.id}
-                    className="p-3.5 flex flex-col md:flex-row md:items-center justify-between gap-3"
-                  >
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <Database className="w-4 h-4 text-[#374151] shrink-0" />
-                        <span className="text-[13.5px] font-semibold text-[#111827]">
-                          {ds.name}
-                        </span>
-                        <span
-                          className={`text-[11.5px] font-medium ${
-                            ds.status === 'connected'
-                              ? 'text-[#16A34A]'
-                              : ds.status === 'error'
-                                ? 'text-[#DC2626]'
-                                : 'text-[#6B7280]'
-                          }`}
-                        >
-                          · {ds.status}
-                        </span>
+                  <div key={ds.id} className="p-3.5 space-y-2.5">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <Database className="w-4 h-4 text-[#374151] shrink-0" />
+                          <span className="text-[13.5px] font-semibold text-[#111827]">
+                            {ds.name}
+                          </span>
+                          <span
+                            className={`text-[11.5px] font-medium ${
+                              ds.status === 'connected'
+                                ? 'text-[#16A34A]'
+                                : ds.status === 'error'
+                                  ? 'text-[#DC2626]'
+                                  : 'text-[#6B7280]'
+                            }`}
+                          >
+                            · {ds.status}
+                          </span>
+                        </div>
+                        <p className="text-[12px] font-mono text-[#6B7280] truncate mt-0.5">
+                          {ds.username}@{ds.host}:{ds.port}/{ds.databaseName} (ssl={ds.sslMode})
+                        </p>
+                        {ds.lastError && (
+                          <p className="text-[11.5px] text-[#DC2626] mt-1">{ds.lastError}</p>
+                        )}
                       </div>
-                      <p className="text-[12px] font-mono text-[#6B7280] truncate mt-0.5">
-                        {ds.username}@{ds.host}:{ds.port}/{ds.databaseName} (ssl={ds.sslMode})
-                      </p>
-                      {ds.lastError && (
-                        <p className="text-[11.5px] text-[#DC2626] mt-1">{ds.lastError}</p>
-                      )}
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        {schemasByDs[ds.id] ? (
+                          <select
+                            value={selectedSchemaByDs[ds.id] ?? ''}
+                            onChange={(e) =>
+                              setSelectedSchemaByDs((prev) => ({
+                                ...prev,
+                                [ds.id]: e.target.value,
+                              }))
+                            }
+                            className="h-8 px-2 text-[12px] border border-[#E5E7EB] rounded bg-white text-[#111827] max-w-[190px]"
+                            title="Target PostgreSQL schema"
+                          >
+                            <option value="">All User Schemas</option>
+                            {schemasByDs[ds.id].map((s) => (
+                              <option key={s.schema} value={s.schema}>
+                                {s.schema} ({s.tableCount})
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={loadingSchemasId === ds.id}
+                            onClick={async () => {
+                              setLoadingSchemasId(ds.id);
+                              try {
+                                const list = await onListDatasourceSchemas(ds.id);
+                                setSchemasByDs((prev) => ({ ...prev, [ds.id]: list }));
+                                if (list.length === 1) {
+                                  setSelectedSchemaByDs((prev) => ({
+                                    ...prev,
+                                    [ds.id]: list[0].schema,
+                                  }));
+                                }
+                              } catch (err) {
+                                setFeedback({
+                                  ok: false,
+                                  text:
+                                    err instanceof Error
+                                      ? err.message
+                                      : 'Failed to load schemas',
+                                });
+                              } finally {
+                                setLoadingSchemasId(null);
+                              }
+                            }}
+                            className="h-8 px-2.5 rounded border border-[#E5E7EB] hover:bg-[#F9FAFB] text-[12px] font-medium text-[#374151] cursor-pointer disabled:opacity-60"
+                            title="List schemas in this database"
+                          >
+                            {loadingSchemasId === ds.id ? 'Loading...' : 'Schemas'}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setUnlockingId(unlockingId === ds.id ? null : ds.id);
+                            setUnlockPassword('');
+                          }}
+                          className="h-8 px-2.5 rounded border border-[#E5E7EB] hover:bg-[#F9FAFB] text-[12px] font-medium text-[#374151] flex items-center gap-1 cursor-pointer"
+                          title="Update stored password"
+                        >
+                          <KeyRound className="w-3.5 h-3.5 text-[#6B7280]" />
+                          <span>Password</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const res = await onTestSavedDatasource(ds.id);
+                            setFeedback({
+                              ok: res.ok,
+                              text: res.ok
+                                ? `${ds.name}: ${res.version} (${res.latencyMs}ms)`
+                                : res.error || 'Connection test failed',
+                            });
+                            if (!res.ok && res.error?.toLowerCase().includes('re-enter')) {
+                              setUnlockingId(ds.id);
+                            }
+                          }}
+                          className="h-8 px-2.5 rounded border border-[#E5E7EB] hover:bg-[#F9FAFB] text-[12px] font-medium text-[#374151] cursor-pointer"
+                        >
+                          Test
+                        </button>
+                        <button
+                          type="button"
+                          disabled={introspectingId === ds.id}
+                          onClick={async () => {
+                            setIntrospectingId(ds.id);
+                            try {
+                              const chosen = selectedSchemaByDs[ds.id];
+                              await onIntrospectDatasource(
+                                ds.id,
+                                chosen ? [chosen] : undefined,
+                              );
+                            } finally {
+                              setIntrospectingId(null);
+                            }
+                          }}
+                          className="h-8 px-3 rounded bg-[#1D4ED8] hover:bg-[#1E40AF] text-white text-[12px] font-medium flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                        >
+                          {introspectingId === ds.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <RefreshCw className="w-3.5 h-3.5" />
+                          )}
+                          Introspect Schema
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onDeleteDatasource(ds.id)}
+                          className="p-1.5 rounded hover:bg-[#FEF2F2] text-[#6B7280] hover:text-[#DC2626] cursor-pointer"
+                          title="Delete datasource"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
                     </div>
 
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          const res = await onTestSavedDatasource(ds.id);
-                          setFeedback({
-                            ok: res.ok,
-                            text: res.ok
-                              ? `${ds.name}: ${res.version} (${res.latencyMs}ms)`
-                              : res.error || 'Connection test failed',
-                          });
-                        }}
-                        className="h-8 px-2.5 rounded border border-[#E5E7EB] hover:bg-[#F9FAFB] text-[12px] font-medium text-[#374151] cursor-pointer"
-                      >
-                        Test
-                      </button>
-                      <button
-                        type="button"
-                        disabled={introspectingId === ds.id}
-                        onClick={async () => {
-                          setIntrospectingId(ds.id);
-                          try {
-                            await onIntrospectDatasource(ds.id);
-                          } finally {
-                            setIntrospectingId(null);
-                          }
-                        }}
-                        className="h-8 px-3 rounded bg-[#1D4ED8] hover:bg-[#1E40AF] text-white text-[12px] font-medium flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
-                      >
-                        {introspectingId === ds.id ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <RefreshCw className="w-3.5 h-3.5" />
-                        )}
-                        Introspect Schema
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => onDeleteDatasource(ds.id)}
-                        className="p-1.5 rounded hover:bg-[#FEF2F2] text-[#6B7280] hover:text-[#DC2626] cursor-pointer"
-                        title="Delete datasource"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
+                    {unlockingId === ds.id && (
+                      <div className="pt-2 border-t border-[#F3F4F6] flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                        <input
+                          type="password"
+                          value={unlockPassword}
+                          onChange={(e) => setUnlockPassword(e.target.value)}
+                          placeholder={`Enter password for ${ds.username}@${ds.host}`}
+                          className="flex-1 h-8 px-2.5 text-[12px] font-mono border border-[#E5E7EB] rounded bg-white"
+                        />
+                        <button
+                          type="button"
+                          disabled={unlockLoading || !unlockPassword}
+                          onClick={async () => {
+                            setUnlockLoading(true);
+                            try {
+                              const res = await onUpdateDatasourcePassword(ds.id, unlockPassword);
+                              if (res.ok) {
+                                setUnlockingId(null);
+                                setUnlockPassword('');
+                                setFeedback({
+                                  ok: true,
+                                  text: `${ds.name} credentials updated and verified.`,
+                                });
+                              } else {
+                                setFeedback({
+                                  ok: false,
+                                  text: res.error || 'Failed to verify password',
+                                });
+                              }
+                            } finally {
+                              setUnlockLoading(false);
+                            }
+                          }}
+                          className="h-8 px-3 rounded bg-[#111827] hover:bg-[#1F2937] text-white text-[12px] font-medium cursor-pointer disabled:opacity-50"
+                        >
+                          {unlockLoading ? 'Verifying...' : 'Save & Verify Password'}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>

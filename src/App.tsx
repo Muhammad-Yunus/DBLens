@@ -52,6 +52,7 @@ export default function App() {
   const [toSnapshotId, setToSnapshotId] = useState<string>('');
   const [diffEnabled, setDiffEnabled] = useState<boolean>(true);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [schemaFilter, setSchemaFilter] = useState<string>('ALL');
 
   // Local editable graph overlay for instant ERD Builder feedback
   const [draftGraph, setDraftGraph] = useState<SchemaGraph | null>(null);
@@ -127,6 +128,7 @@ export default function App() {
       setToSnapshotId(data.workspace.activeSnapshotId);
       setDraftGraph(null);
       setHasUnsavedEdits(false);
+      setSchemaFilter('ALL');
     },
     [apiFetch],
   );
@@ -213,6 +215,7 @@ export default function App() {
     setToSnapshotId(preview.workspace.activeSnapshotId);
     setDraftGraph(null);
     setHasUnsavedEdits(false);
+    setSchemaFilter('ALL');
     showToast('Signed out');
   };
 
@@ -240,12 +243,61 @@ export default function App() {
     return fromSnap?.schemaJson ?? { dialect: 'postgresql', nodes: [], relations: [] };
   }, [fromSnap]);
 
+  const availableSchemas = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const node of activeGraph.nodes) {
+      const s = node.schema || 'public';
+      counts.set(s, (counts.get(s) ?? 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([schema, count]) => ({ schema, count }))
+      .sort((a, b) => a.schema.localeCompare(b.schema));
+  }, [activeGraph.nodes]);
+
+  const activeSchemaFilter =
+    schemaFilter !== 'ALL' && availableSchemas.some((s) => s.schema === schemaFilter)
+      ? schemaFilter
+      : 'ALL';
+
+  const filteredGraph: SchemaGraph = useMemo(() => {
+    if (activeSchemaFilter === 'ALL' || availableSchemas.length <= 1) {
+      return activeGraph;
+    }
+    const nodes = activeGraph.nodes.filter(
+      (n) => (n.schema || 'public') === activeSchemaFilter,
+    );
+    const nodeIds = new Set(nodes.map((n) => n.id));
+    const relations = activeGraph.relations.filter(
+      (r) => nodeIds.has(r.sourceId) && nodeIds.has(r.targetId),
+    );
+    return { ...activeGraph, nodes, relations };
+  }, [activeGraph, activeSchemaFilter, availableSchemas.length]);
+
   const computedDiff = useMemo(() => {
     return computeClientSchemaDiff(baselineGraph, activeGraph);
   }, [baselineGraph, activeGraph]);
 
   const handleUpdateGraph = (nextGraph: SchemaGraph) => {
-    setDraftGraph(nextGraph);
+    if (activeSchemaFilter === 'ALL' || availableSchemas.length <= 1) {
+      setDraftGraph(nextGraph);
+    } else {
+      const otherNodes = activeGraph.nodes.filter(
+        (n) => (n.schema || 'public') !== activeSchemaFilter,
+      );
+      const filteredNodeIds = new Set(
+        activeGraph.nodes
+          .filter((n) => (n.schema || 'public') === activeSchemaFilter)
+          .map((n) => n.id),
+      );
+      const externalRelations = activeGraph.relations.filter(
+        (r) => !filteredNodeIds.has(r.sourceId) || !filteredNodeIds.has(r.targetId),
+      );
+      setDraftGraph({
+        ...activeGraph,
+        nodes: [...otherNodes, ...nextGraph.nodes],
+        relations: [...externalRelations, ...nextGraph.relations],
+      });
+    }
     setHasUnsavedEdits(true);
   };
 
@@ -388,19 +440,26 @@ export default function App() {
                 setToSnapshotId(t);
                 setDraftGraph(null);
                 setHasUnsavedEdits(false);
+                setSchemaFilter('ALL');
               }}
               diffEnabled={diffEnabled}
               onToggleDiff={() => setDiffEnabled((v) => !v)}
-              activeGraph={activeGraph}
+              activeGraph={filteredGraph}
               diff={computedDiff}
               selectedNodeId={selectedNodeId}
+              availableSchemas={availableSchemas}
+              schemaFilter={activeSchemaFilter}
+              onChangeSchemaFilter={(s) => {
+                setSchemaFilter(s);
+                setSelectedNodeId(null);
+              }}
               onSelectNode={(id) => {
                 setSelectedNodeId(id);
-                // Ensure clicked node is visible on canvas
-                if (draftGraph) {
+                const clicked = activeGraph.nodes.find((n) => n.id === id);
+                if (clicked && clicked.visibleOnCanvas === false) {
                   setDraftGraph({
-                    ...draftGraph,
-                    nodes: draftGraph.nodes.map((n) =>
+                    ...activeGraph,
+                    nodes: activeGraph.nodes.map((n) =>
                       n.id === id ? { ...n, visibleOnCanvas: true } : n,
                     ),
                   });
@@ -451,7 +510,7 @@ export default function App() {
 
               {overviewSubTab === 'erd' && (
                 <ErdCanvas
-                  graph={activeGraph}
+                  graph={filteredGraph}
                   diff={computedDiff}
                   diffEnabled={diffEnabled}
                   selectedNodeId={selectedNodeId}
@@ -680,18 +739,52 @@ export default function App() {
                 };
               }
             }}
-            onIntrospectDatasource={async (dsId) => {
+            onUpdateDatasourcePassword={async (dsId, newPassword) => {
               try {
-                const res = await apiFetch<{ objectCount: number }>(
+                await apiFetch(`/api/workspaces/${bundle.workspace.id}/datasources/${dsId}`, {
+                  method: 'PATCH',
+                  body: JSON.stringify({ password: newPassword }),
+                });
+                await loadWorkspaceBundle(bundle.workspace.id);
+                return { ok: true };
+              } catch (err) {
+                await loadWorkspaceBundle(bundle.workspace.id);
+                return {
+                  ok: false,
+                  error: err instanceof Error ? err.message : 'Failed to update password',
+                };
+              }
+            }}
+            onListDatasourceSchemas={async (dsId) => {
+              const res = await apiFetch<{
+                schemas: { schema: string; tableCount: number }[];
+              }>(`/api/workspaces/${bundle.workspace.id}/datasources/${dsId}/schemas`);
+              return res.schemas;
+            }}
+            onIntrospectDatasource={async (dsId, schemas) => {
+              try {
+                const res = await apiFetch<{ objectCount: number; schemas?: string[] }>(
                   `/api/workspaces/${bundle.workspace.id}/datasources/${dsId}/introspect`,
-                  { method: 'POST' },
+                  {
+                    method: 'POST',
+                    body: JSON.stringify(
+                      schemas && schemas.length > 0 ? { schemas } : {},
+                    ),
+                  },
                 );
                 await loadWorkspaceBundle(bundle.workspace.id);
                 setPrimaryTab('overview');
                 setOverviewSubTab('erd');
-                showToast(`Introspected ${res.objectCount} database objects into ERD!`);
-                pushNotification(`Introspected ${res.objectCount} objects from PostgreSQL`);
+                const scopeLabel =
+                  schemas && schemas.length > 0 ? ` (${schemas.join(', ')})` : '';
+                showToast(
+                  `Introspected ${res.objectCount} database objects${scopeLabel} into ERD!`,
+                );
+                pushNotification(
+                  `Introspected ${res.objectCount} objects from PostgreSQL${scopeLabel}`,
+                );
               } catch (err) {
+                await loadWorkspaceBundle(bundle.workspace.id).catch(() => undefined);
                 showToast(
                   err instanceof Error ? err.message : 'Introspection failed',
                   true,

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Database,
   Plus,
@@ -383,9 +383,13 @@ export const WebhooksView: React.FC<{
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim() || !url.trim()) return;
-    await onCreateWebhook(name.trim(), url.trim(), ['schema.diff.detected', 'migration.applied']);
-    setName('');
-    setUrl('');
+    try {
+      await onCreateWebhook(name.trim(), url.trim(), ['schema.diff.detected', 'migration.applied']);
+      setName('');
+      setUrl('');
+    } catch {
+      // Error toast is handled by parent
+    }
   };
 
   return (
@@ -474,12 +478,24 @@ export const TagsView: React.FC<{
   const [description, setDescription] = useState('');
   const [snapshotId, setSnapshotId] = useState(snapshots[snapshots.length - 1]?.id || '');
 
+  useEffect(() => {
+    if (snapshots.length === 0) {
+      setSnapshotId('');
+    } else if (!snapshots.some((s) => s.id === snapshotId)) {
+      setSnapshotId(snapshots[snapshots.length - 1].id);
+    }
+  }, [snapshots, snapshotId]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
-    await onCreateTag(name.trim(), '#1D4ED8', snapshotId || null, description.trim());
-    setName('');
-    setDescription('');
+    try {
+      await onCreateTag(name.trim(), '#1D4ED8', snapshotId || null, description.trim());
+      setName('');
+      setDescription('');
+    } catch {
+      // Error toast is handled by parent
+    }
   };
 
   return (
@@ -644,6 +660,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const [orgSlug, setOrgSlug] = useState(workspace.orgSlug);
   const [wsName, setWsName] = useState(workspace.name);
+
+  useEffect(() => {
+    setOrgSlug(workspace.orgSlug);
+    setWsName(workspace.name);
+  }, [workspace.id, workspace.orgSlug, workspace.name]);
 
   const handleTest = async () => {
     if (!isAuthenticated) {

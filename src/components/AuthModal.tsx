@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, Loader2, ShieldCheck } from 'lucide-react';
 
 interface AuthModalProps {
@@ -24,6 +24,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setMode(hasUsers ? 'login' : 'register');
+      setError(null);
+    }
+  }, [hasUsers, open]);
 
   if (!open) return null;
 

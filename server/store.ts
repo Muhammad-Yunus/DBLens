@@ -695,17 +695,31 @@ export async function createSnapshot(input: {
   };
 }
 
-export async function updateSnapshotSchema(snapshotId: string, schemaJson: SchemaGraph): Promise<void> {
+export async function updateSnapshotSchema(
+  workspaceId: string,
+  snapshotId: string,
+  schemaJson: SchemaGraph,
+): Promise<boolean> {
   const db = getDb();
   if (db) {
-    await db
+    const updated = await db
       .update(schemaSnapshots)
       .set({ schemaJson })
-      .where(eq(schemaSnapshots.id, snapshotId));
-    return;
+      .where(
+        and(
+          eq(schemaSnapshots.id, snapshotId),
+          eq(schemaSnapshots.workspaceId, workspaceId),
+        ),
+      )
+      .returning({ id: schemaSnapshots.id });
+    return updated.length > 0;
   }
-  const snap = mem.snapshots.find((s) => s.id === snapshotId);
-  if (snap) snap.schemaJson = schemaJson;
+  const snap = mem.snapshots.find(
+    (s) => s.id === snapshotId && s.workspaceId === workspaceId,
+  );
+  if (!snap) return false;
+  snap.schemaJson = schemaJson;
+  return true;
 }
 
 export async function createDatasource(input: {
@@ -784,6 +798,7 @@ export async function createDatasource(input: {
 export async function getDatasourceWithSecret(
   datasourceId: string,
   ownerId: string,
+  workspaceId?: string,
 ): Promise<{
   id: string;
   workspaceId: string;
@@ -797,10 +812,14 @@ export async function getDatasourceWithSecret(
 } | null> {
   const db = getDb();
   if (db) {
-    const rows = await db
-      .select()
-      .from(datasources)
-      .where(and(eq(datasources.id, datasourceId), eq(datasources.ownerId, ownerId)));
+    const cond = workspaceId
+      ? and(
+          eq(datasources.id, datasourceId),
+          eq(datasources.ownerId, ownerId),
+          eq(datasources.workspaceId, workspaceId),
+        )
+      : and(eq(datasources.id, datasourceId), eq(datasources.ownerId, ownerId));
+    const rows = await db.select().from(datasources).where(cond);
     const row = rows[0];
     if (!row) return null;
     try {
@@ -825,7 +844,12 @@ export async function getDatasourceWithSecret(
       throw err;
     }
   }
-  const found = mem.datasources.find((d) => d.id === datasourceId && d.ownerId === ownerId);
+  const found = mem.datasources.find(
+    (d) =>
+      d.id === datasourceId &&
+      d.ownerId === ownerId &&
+      (!workspaceId || d.workspaceId === workspaceId),
+  );
   if (!found) return null;
   try {
     return {
@@ -1019,6 +1043,7 @@ export async function createMigrationRecord(input: {
 }
 
 export async function updateMigrationStatus(
+  workspaceId: string,
   migrationId: string,
   status: 'pending' | 'applied' | 'failed',
 ): Promise<void> {
@@ -1031,10 +1056,14 @@ export async function updateMigrationStatus(
         status,
         appliedAt: status === 'applied' ? now : null,
       })
-      .where(eq(migrations.id, migrationId));
+      .where(
+        and(eq(migrations.id, migrationId), eq(migrations.workspaceId, workspaceId)),
+      );
     return;
   }
-  const m = mem.migrations.find((x) => x.id === migrationId);
+  const m = mem.migrations.find(
+    (x) => x.id === migrationId && x.workspaceId === workspaceId,
+  );
   if (m) {
     m.status = status;
     m.appliedAt = status === 'applied' ? now.toISOString() : null;
@@ -1108,23 +1137,88 @@ export async function createWebhookRecord(input: {
   };
 }
 
-export async function toggleWebhookRecord(webhookId: string, enabled: boolean): Promise<void> {
+export async function toggleWebhookRecord(
+  workspaceId: string,
+  webhookId: string,
+  enabled: boolean,
+): Promise<boolean> {
   const db = getDb();
   if (db) {
-    await db.update(webhooks).set({ enabled }).where(eq(webhooks.id, webhookId));
+    const updated = await db
+      .update(webhooks)
+      .set({ enabled })
+      .where(and(eq(webhooks.id, webhookId), eq(webhooks.workspaceId, workspaceId)))
+      .returning({ id: webhooks.id });
+    return updated.length > 0;
+  }
+  const w = mem.webhooks.find(
+    (x) => x.id === webhookId && x.workspaceId === workspaceId,
+  );
+  if (!w) return false;
+  w.enabled = enabled;
+  return true;
+}
+
+export async function deleteWebhookRecord(
+  workspaceId: string,
+  webhookId: string,
+): Promise<boolean> {
+  const db = getDb();
+  if (db) {
+    const deleted = await db
+      .delete(webhooks)
+      .where(and(eq(webhooks.id, webhookId), eq(webhooks.workspaceId, workspaceId)))
+      .returning({ id: webhooks.id });
+    return deleted.length > 0;
+  }
+  const idx = mem.webhooks.findIndex(
+    (w) => w.id === webhookId && w.workspaceId === workspaceId,
+  );
+  if (idx === -1) return false;
+  mem.webhooks.splice(idx, 1);
+  return true;
+}
+
+export async function listEnabledWebhooksForEvent(
+  workspaceId: string,
+  event: string,
+): Promise<WebhookDTO[]> {
+  const db = getDb();
+  if (db) {
+    const rows = await db
+      .select()
+      .from(webhooks)
+      .where(and(eq(webhooks.workspaceId, workspaceId), eq(webhooks.enabled, true)));
+    return rows
+      .filter((w) => Array.isArray(w.events) && w.events.includes(event))
+      .map((w) => ({
+        id: w.id,
+        workspaceId: w.workspaceId,
+        name: w.name,
+        url: w.url,
+        events: w.events,
+        enabled: w.enabled,
+        lastTriggeredAt: w.lastTriggeredAt?.toISOString() ?? null,
+        createdAt: w.createdAt.toISOString(),
+      }));
+  }
+  return mem.webhooks.filter(
+    (w) => w.workspaceId === workspaceId && w.enabled && w.events.includes(event),
+  );
+}
+
+export async function markWebhookTriggered(webhookId: string): Promise<void> {
+  const now = new Date();
+  const db = getDb();
+  if (db) {
+    await db
+      .update(webhooks)
+      .set({ lastTriggeredAt: now })
+      .where(eq(webhooks.id, webhookId));
     return;
   }
   const w = mem.webhooks.find((x) => x.id === webhookId);
-  if (w) w.enabled = enabled;
-}
-
-export async function deleteWebhookRecord(webhookId: string): Promise<void> {
-  const db = getDb();
-  if (db) {
-    await db.delete(webhooks).where(eq(webhooks.id, webhookId));
-    return;
-  }
-  mem.webhooks = mem.webhooks.filter((w) => w.id !== webhookId);
+  if (w) w.lastTriggeredAt = now.toISOString();
 }
 
 export async function createTagRecord(input: {
@@ -1153,11 +1247,22 @@ export async function createTagRecord(input: {
   return { ...input, id, createdAt: now.toISOString() };
 }
 
-export async function deleteTagRecord(tagId: string): Promise<void> {
+export async function deleteTagRecord(
+  workspaceId: string,
+  tagId: string,
+): Promise<boolean> {
   const db = getDb();
   if (db) {
-    await db.delete(tags).where(eq(tags.id, tagId));
-    return;
+    const deleted = await db
+      .delete(tags)
+      .where(and(eq(tags.id, tagId), eq(tags.workspaceId, workspaceId)))
+      .returning({ id: tags.id });
+    return deleted.length > 0;
   }
-  mem.tags = mem.tags.filter((t) => t.id !== tagId);
+  const idx = mem.tags.findIndex(
+    (t) => t.id === tagId && t.workspaceId === workspaceId,
+  );
+  if (idx === -1) return false;
+  mem.tags.splice(idx, 1);
+  return true;
 }

@@ -43,17 +43,48 @@ const INTERNAL_SYSTEM_SCHEMAS = [
 ];
 
 export function validateDatasourceHost(host: string): void {
-  const trimmed = host.trim().toLowerCase();
+  const trimmed = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
   if (!trimmed || trimmed.length > 253) {
     throw new Error('Invalid database host');
   }
   if (BLOCKED_HOSTS.has(trimmed)) {
     throw new Error('Metadata service hosts are not permitted');
   }
+  if (trimmed === '0.0.0.0' || trimmed === '::' || trimmed === '::1') {
+    throw new Error('Loopback or unspecified hosts are not permitted');
+  }
+  if (
+    process.env.NODE_ENV === 'production' &&
+    process.env.ALLOW_LOCAL_DATASOURCES !== 'true' &&
+    (trimmed === 'localhost' || trimmed.endsWith('.localhost'))
+  ) {
+    throw new Error('Localhost datasources are disabled in production');
+  }
   if (net.isIPv4(trimmed)) {
     const parts = trimmed.split('.').map(Number);
     if (parts[0] === 169 && parts[1] === 254) {
       throw new Error('Link-local addresses are not permitted');
+    }
+    if (parts[0] === 0) {
+      throw new Error('Unspecified addresses are not permitted');
+    }
+    if (
+      process.env.NODE_ENV === 'production' &&
+      process.env.ALLOW_LOCAL_DATASOURCES !== 'true' &&
+      parts[0] === 127
+    ) {
+      throw new Error('Loopback addresses are disabled in production');
+    }
+  }
+  if (net.isIPv6(trimmed)) {
+    if (
+      trimmed.startsWith('fe80:') ||
+      trimmed.startsWith('fc') ||
+      trimmed.startsWith('fd') ||
+      trimmed.startsWith('::ffff:127.') ||
+      trimmed.startsWith('::ffff:169.254.')
+    ) {
+      throw new Error('Loopback or link-local IPv6 addresses are not permitted');
     }
   }
   if (!/^[a-z0-9.-]+$/.test(trimmed) && !net.isIPv6(trimmed)) {
@@ -70,7 +101,10 @@ export interface PostgresConnectionParams {
   sslMode: 'require' | 'prefer' | 'disable';
 }
 
-function buildClientConfig(params: PostgresConnectionParams): pg.ClientConfig {
+function buildClientConfig(
+  params: PostgresConnectionParams,
+  forceNoSsl = false,
+): pg.ClientConfig {
   validateDatasourceHost(params.host);
   return {
     host: params.host.trim(),
@@ -80,7 +114,7 @@ function buildClientConfig(params: PostgresConnectionParams): pg.ClientConfig {
     password: params.password,
     connectionTimeoutMillis: 8000,
     ssl:
-      params.sslMode === 'disable'
+      forceNoSsl || params.sslMode === 'disable'
         ? false
         : {
             rejectUnauthorized: false,
@@ -88,13 +122,34 @@ function buildClientConfig(params: PostgresConnectionParams): pg.ClientConfig {
   };
 }
 
+export async function connectPostgresClient(
+  params: PostgresConnectionParams,
+): Promise<pg.Client> {
+  const client = new pg.Client(buildClientConfig(params, false));
+  try {
+    await client.connect();
+    return client;
+  } catch (err) {
+    await client.end().catch(() => undefined);
+    const msg = err instanceof Error ? err.message : '';
+    if (
+      params.sslMode === 'prefer' &&
+      msg.toLowerCase().includes('does not support ssl')
+    ) {
+      const fallbackClient = new pg.Client(buildClientConfig(params, true));
+      await fallbackClient.connect();
+      return fallbackClient;
+    }
+    throw err;
+  }
+}
+
 export async function testPostgresConnection(
   params: PostgresConnectionParams,
 ): Promise<{ version: string; latencyMs: number }> {
   const started = Date.now();
-  const client = new pg.Client(buildClientConfig(params));
+  const client = await connectPostgresClient(params);
   try {
-    await client.connect();
     const res = await client.query<{ version: string }>('SELECT version() AS version');
     const latencyMs = Date.now() - started;
     return {
@@ -109,9 +164,8 @@ export async function testPostgresConnection(
 export async function listPostgresSchemas(
   params: PostgresConnectionParams,
 ): Promise<{ schema: string; tableCount: number }[]> {
-  const client = new pg.Client(buildClientConfig(params));
+  const client = await connectPostgresClient(params);
   try {
-    await client.connect();
     const res = await client.query<{ schema_name: string; table_count: string }>(
       `
       SELECT
@@ -143,7 +197,7 @@ export async function introspectPostgresSchema(
   params: PostgresConnectionParams,
   options?: { schemas?: string[] },
 ): Promise<SchemaGraph> {
-  const client = new pg.Client(buildClientConfig(params));
+  const client = await connectPostgresClient(params);
   const selectedSchemas =
     options?.schemas
       ?.map((s) => s.trim())

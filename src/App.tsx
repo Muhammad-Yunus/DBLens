@@ -410,8 +410,16 @@ export default function App() {
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
         workspace={bundle.workspace}
         workspaces={workspaces}
-        onSelectWorkspace={(id) => {
-          if (token) loadWorkspaceBundle(id);
+        onSelectWorkspace={async (id) => {
+          if (!token) return;
+          try {
+            await loadWorkspaceBundle(id);
+          } catch (err) {
+            showToast(
+              err instanceof Error ? err.message : 'Failed to switch workspace',
+              true,
+            );
+          }
         }}
         onCreateWorkspace={handleCreateWorkspace}
         user={user}
@@ -574,12 +582,19 @@ export default function App() {
             ciRuns={bundle.ciRuns}
             onTriggerRun={async (branch) => {
               if (!requireAuthenticated()) return;
-              await apiFetch(`/api/workspaces/${bundle.workspace.id}/ci-runs`, {
-                method: 'POST',
-                body: JSON.stringify({ branch }),
-              });
-              await loadWorkspaceBundle(bundle.workspace.id);
-              showToast('Schema CI lint run completed');
+              try {
+                await apiFetch(`/api/workspaces/${bundle.workspace.id}/ci-runs`, {
+                  method: 'POST',
+                  body: JSON.stringify({ branch }),
+                });
+                await loadWorkspaceBundle(bundle.workspace.id);
+                showToast('Schema CI lint run completed');
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Failed to run CI check',
+                  true,
+                );
+              }
             }}
           />
         )}
@@ -615,7 +630,9 @@ export default function App() {
           <WebhooksView
             webhooks={bundle.webhooks}
             onCreateWebhook={async (name, url, events) => {
-              if (!requireAuthenticated()) return;
+              if (!requireAuthenticated()) {
+                throw new Error('Authentication required');
+              }
               try {
                 await apiFetch(`/api/workspaces/${bundle.workspace.id}/webhooks`, {
                   method: 'POST',
@@ -628,27 +645,42 @@ export default function App() {
                   err instanceof Error ? err.message : 'Failed to add webhook',
                   true,
                 );
+                throw err;
               }
             }}
             onToggleWebhook={async (whId, enabled) => {
               if (!requireAuthenticated()) return;
-              await apiFetch(
-                `/api/workspaces/${bundle.workspace.id}/webhooks/${whId}`,
-                {
-                  method: 'PATCH',
-                  body: JSON.stringify({ enabled }),
-                },
-              );
-              await loadWorkspaceBundle(bundle.workspace.id);
+              try {
+                await apiFetch(
+                  `/api/workspaces/${bundle.workspace.id}/webhooks/${whId}`,
+                  {
+                    method: 'PATCH',
+                    body: JSON.stringify({ enabled }),
+                  },
+                );
+                await loadWorkspaceBundle(bundle.workspace.id);
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Failed to toggle webhook',
+                  true,
+                );
+              }
             }}
             onDeleteWebhook={async (whId) => {
               if (!requireAuthenticated()) return;
-              await apiFetch(
-                `/api/workspaces/${bundle.workspace.id}/webhooks/${whId}`,
-                { method: 'DELETE' },
-              );
-              await loadWorkspaceBundle(bundle.workspace.id);
-              showToast('Webhook removed');
+              try {
+                await apiFetch(
+                  `/api/workspaces/${bundle.workspace.id}/webhooks/${whId}`,
+                  { method: 'DELETE' },
+                );
+                await loadWorkspaceBundle(bundle.workspace.id);
+                showToast('Webhook removed');
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Failed to remove webhook',
+                  true,
+                );
+              }
             }}
           />
         )}
@@ -658,21 +690,38 @@ export default function App() {
             tags={bundle.tags}
             snapshots={bundle.snapshots}
             onCreateTag={async (name, color, targetSnapshotId, description) => {
-              if (!requireAuthenticated()) return;
-              await apiFetch(`/api/workspaces/${bundle.workspace.id}/tags`, {
-                method: 'POST',
-                body: JSON.stringify({ name, color, targetSnapshotId, description }),
-              });
-              await loadWorkspaceBundle(bundle.workspace.id);
-              showToast(`Tag ${name} created`);
+              if (!requireAuthenticated()) {
+                throw new Error('Authentication required');
+              }
+              try {
+                await apiFetch(`/api/workspaces/${bundle.workspace.id}/tags`, {
+                  method: 'POST',
+                  body: JSON.stringify({ name, color, targetSnapshotId, description }),
+                });
+                await loadWorkspaceBundle(bundle.workspace.id);
+                showToast(`Tag ${name} created`);
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Failed to create tag',
+                  true,
+                );
+                throw err;
+              }
             }}
             onDeleteTag={async (tagId) => {
               if (!requireAuthenticated()) return;
-              await apiFetch(`/api/workspaces/${bundle.workspace.id}/tags/${tagId}`, {
-                method: 'DELETE',
-              });
-              await loadWorkspaceBundle(bundle.workspace.id);
-              showToast('Tag removed');
+              try {
+                await apiFetch(`/api/workspaces/${bundle.workspace.id}/tags/${tagId}`, {
+                  method: 'DELETE',
+                });
+                await loadWorkspaceBundle(bundle.workspace.id);
+                showToast('Tag removed');
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Failed to remove tag',
+                  true,
+                );
+              }
             }}
           />
         )}
@@ -792,21 +841,35 @@ export default function App() {
               }
             }}
             onDeleteDatasource={async (dsId) => {
-              await apiFetch(
-                `/api/workspaces/${bundle.workspace.id}/datasources/${dsId}`,
-                { method: 'DELETE' },
-              );
-              await loadWorkspaceBundle(bundle.workspace.id);
-              showToast('Datasource removed');
+              try {
+                await apiFetch(
+                  `/api/workspaces/${bundle.workspace.id}/datasources/${dsId}`,
+                  { method: 'DELETE' },
+                );
+                await loadWorkspaceBundle(bundle.workspace.id);
+                showToast('Datasource removed');
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Failed to remove datasource',
+                  true,
+                );
+              }
             }}
             onRenameWorkspace={async (orgSlug, name) => {
               if (!requireAuthenticated()) return;
-              await apiFetch(`/api/workspaces/${bundle.workspace.id}`, {
-                method: 'PATCH',
-                body: JSON.stringify({ orgSlug, name }),
-              });
-              await loadWorkspaceBundle(bundle.workspace.id);
-              showToast('Workspace updated');
+              try {
+                await apiFetch(`/api/workspaces/${bundle.workspace.id}`, {
+                  method: 'PATCH',
+                  body: JSON.stringify({ orgSlug, name }),
+                });
+                await loadWorkspaceBundle(bundle.workspace.id);
+                showToast('Workspace updated');
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Failed to update workspace',
+                  true,
+                );
+              }
             }}
           />
         )}

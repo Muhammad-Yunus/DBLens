@@ -117,23 +117,35 @@ export async function connectPrimaryDatabase(connectionConfig: {
   password: string;
   sslMode?: 'require' | 'prefer' | 'disable';
 }): Promise<{ ok: boolean; label: string; error?: string }> {
-  const poolConfig: pg.PoolConfig = {
-    host: connectionConfig.host,
-    port: connectionConfig.port ?? 5432,
-    database: connectionConfig.database,
-    user: connectionConfig.user,
-    password: connectionConfig.password,
-    ssl:
-      connectionConfig.sslMode === 'disable'
-        ? false
-        : { rejectUnauthorized: false },
-    connectionTimeoutMillis: 8000,
-    max: 10,
-  };
+  const makePool = (useSsl: boolean) =>
+    new pg.Pool({
+      host: connectionConfig.host,
+      port: connectionConfig.port ?? 5432,
+      database: connectionConfig.database,
+      user: connectionConfig.user,
+      password: connectionConfig.password,
+      ssl: useSsl ? { rejectUnauthorized: false } : false,
+      connectionTimeoutMillis: 8000,
+      max: 10,
+    });
 
-  const nextPool = new pg.Pool(poolConfig);
+  let nextPool = makePool(connectionConfig.sslMode !== 'disable');
   try {
-    await nextPool.query('SELECT 1');
+    try {
+      await nextPool.query('SELECT 1');
+    } catch (firstErr) {
+      const msg = firstErr instanceof Error ? firstErr.message : '';
+      if (
+        connectionConfig.sslMode === 'prefer' &&
+        msg.toLowerCase().includes('does not support ssl')
+      ) {
+        await nextPool.end().catch(() => undefined);
+        nextPool = makePool(false);
+        await nextPool.query('SELECT 1');
+      } else {
+        throw firstErr;
+      }
+    }
     await ensureSchemaTables(nextPool);
     if (activePool) {
       await activePool.end().catch(() => undefined);
@@ -149,6 +161,15 @@ export async function connectPrimaryDatabase(connectionConfig: {
     const msg = err instanceof Error ? err.message : 'Failed to connect to PostgreSQL';
     lastDbError = msg;
     return { ok: false, label: '', error: msg };
+  }
+}
+
+export async function closePrimaryDatabase(): Promise<void> {
+  if (activePool) {
+    await activePool.end().catch(() => undefined);
+    activePool = null;
+    activeDb = null;
+    activeConnectionLabel = null;
   }
 }
 

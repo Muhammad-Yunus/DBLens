@@ -2,8 +2,14 @@ import 'dotenv/config';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
-import pg from 'pg';
-import { initDatabaseFromEnv, connectPrimaryDatabase, getDbStatus } from './src/db/index.ts';
+import net from 'node:net';
+import {
+  initDatabaseFromEnv,
+  connectPrimaryDatabase,
+  closePrimaryDatabase,
+  getDbStatus,
+  getPool,
+} from './src/db/index.ts';
 import {
   getPublicDemoBundle,
   getUserCount,
@@ -30,11 +36,14 @@ import {
   createWebhookRecord,
   toggleWebhookRecord,
   deleteWebhookRecord,
+  listEnabledWebhooksForEvent,
+  markWebhookTriggered,
   createTagRecord,
   deleteTagRecord,
 } from './server/store.ts';
 import { CredentialDecryptionError } from './server/crypto.ts';
 import {
+  connectPostgresClient,
   testPostgresConnection,
   listPostgresSchemas,
   introspectPostgresSchema,
@@ -106,28 +115,142 @@ function validateWebhookUrl(rawUrl: string): string {
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
     throw new Error('Webhook URL must use http or https');
   }
-  const host = parsed.hostname.toLowerCase();
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (
     host === 'localhost' ||
-    host === '127.0.0.1' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host === '0.0.0.0' ||
+    host === '::' ||
     host === '::1' ||
-    host === '169.254.169.254' ||
-    host.startsWith('10.') ||
-    host.startsWith('192.168.')
+    host === 'metadata.google.internal' ||
+    host === 'metadata.goog'
   ) {
     throw new Error('Private or loopback webhook hosts are not permitted');
   }
+  if (net.isIPv4(host)) {
+    const parts = host.split('.').map(Number);
+    const [a, b] = parts;
+    if (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168)
+    ) {
+      throw new Error('Private or loopback webhook IP addresses are not permitted');
+    }
+  }
+  if (net.isIPv6(host)) {
+    if (
+      host.startsWith('fe80:') ||
+      host.startsWith('fc') ||
+      host.startsWith('fd') ||
+      host.startsWith('::ffff:')
+    ) {
+      throw new Error('Private or link-local IPv6 webhook addresses are not permitted');
+    }
+  }
   return parsed.toString();
+}
+
+async function dispatchWorkspaceWebhooks(
+  workspaceId: string,
+  event: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  try {
+    const hooks = await listEnabledWebhooksForEvent(workspaceId, event);
+    if (hooks.length === 0) return;
+    await Promise.allSettled(
+      hooks.map(async (wh) => {
+        const safeUrl = validateWebhookUrl(wh.url);
+        const res = await fetch(safeUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-DBLens-Event': event,
+          },
+          body: JSON.stringify({
+            event,
+            workspaceId,
+            timestamp: new Date().toISOString(),
+            ...payload,
+          }),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (res.ok) {
+          await markWebhookTriggered(wh.id);
+        }
+      }),
+    );
+  } catch (err) {
+    console.warn('[DBLens Webhook Dispatch Warning]', err);
+  }
+}
+
+const authRateBuckets = new Map<string, { count: number; resetAt: number }>();
+function checkAuthRateLimit(req: Request, res: Response, next: NextFunction): void {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000;
+  const maxAttempts = 25;
+  const current = authRateBuckets.get(ip);
+  if (!current || current.resetAt <= now) {
+    authRateBuckets.set(ip, { count: 1, resetAt: now + windowMs });
+    next();
+    return;
+  }
+  if (current.count >= maxAttempts) {
+    res.status(429).json({ error: 'Too many authentication attempts. Please try again later.' });
+    return;
+  }
+  current.count += 1;
+  next();
 }
 
 async function startServer(): Promise<void> {
   await initDatabaseFromEnv();
 
+  if (
+    process.env.NODE_ENV === 'production' &&
+    !process.env.DATASOURCE_ENCRYPTION_KEY?.trim()
+  ) {
+    console.warn(
+      '[DBLens] Warning: DATASOURCE_ENCRYPTION_KEY is not set in production. Set a static key so encrypted datasource credentials remain consistent across restarts.',
+    );
+  }
+
   const app = express();
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('X-DNS-Prefetch-Control', 'off');
+    next();
+  });
   app.use(express.json({ limit: '2mb' }));
 
-  app.get('/api/health', (_req, res) => {
+  app.get('/api/health', async (_req, res) => {
     const db = getDbStatus();
+    if (db.mode === 'postgresql') {
+      const pool = getPool();
+      try {
+        await pool?.query('SELECT 1');
+        res.json({ ok: true, storageMode: db.mode, label: db.label });
+        return;
+      } catch {
+        res.status(503).json({
+          ok: false,
+          storageMode: db.mode,
+          error: 'PostgreSQL health check failed',
+        });
+        return;
+      }
+    }
     res.json({ ok: true, storageMode: db.mode, label: db.label });
   });
 
@@ -150,8 +273,13 @@ async function startServer(): Promise<void> {
     }
   });
 
-  app.post('/api/auth/register', async (req, res, next) => {
+  app.post('/api/auth/register', checkAuthRateLimit, async (req, res) => {
     try {
+      const existingUsers = await getUserCount();
+      if (existingUsers > 0 && process.env.DISABLE_SIGNUP === 'true') {
+        res.status(403).json({ error: 'Public registration is disabled by administrator.' });
+        return;
+      }
       const email = typeof req.body?.email === 'string' ? req.body.email : '';
       const name = typeof req.body?.name === 'string' ? req.body.name : '';
       const password = typeof req.body?.password === 'string' ? req.body.password : '';
@@ -169,7 +297,7 @@ async function startServer(): Promise<void> {
     }
   });
 
-  app.post('/api/auth/login', async (req, res) => {
+  app.post('/api/auth/login', checkAuthRateLimit, async (req, res) => {
     try {
       const email = typeof req.body?.email === 'string' ? req.body.email : '';
       const password = typeof req.body?.password === 'string' ? req.body.password : '';
@@ -206,9 +334,15 @@ async function startServer(): Promise<void> {
       const userCount = await getUserCount();
       const token = extractBearerToken(req);
       const user = token ? await verifySessionToken(token) : null;
+      const requireAdminAlways = process.env.NODE_ENV === 'production' || userCount > 0;
 
-      if (userCount > 0 && (!user || user.role !== 'admin')) {
-        res.status(403).json({ error: 'Admin authentication required to configure system storage.' });
+      if (requireAdminAlways && (!user || user.role !== 'admin')) {
+        res.status(403).json({
+          error:
+            userCount === 0
+              ? 'Please register the initial Admin account before configuring system PostgreSQL storage.'
+              : 'Admin authentication required to configure system storage.',
+        });
         return;
       }
 
@@ -368,7 +502,20 @@ async function startServer(): Promise<void> {
           res.status(400).json({ error: 'Valid schemaJson is required' });
           return;
         }
-        await updateSnapshotSchema(String(req.params.snapshotId), schemaJson);
+        const workspaceId = String(req.params.id);
+        const updated = await updateSnapshotSchema(
+          workspaceId,
+          String(req.params.snapshotId),
+          schemaJson,
+        );
+        if (!updated) {
+          res.status(404).json({ error: 'Snapshot not found in this workspace' });
+          return;
+        }
+        void dispatchWorkspaceWebhooks(workspaceId, 'schema.diff.detected', {
+          snapshotId: String(req.params.snapshotId),
+          nodeCount: schemaJson.nodes.length,
+        });
         res.json({ ok: true });
       } catch (err) {
         next(err);
@@ -582,7 +729,12 @@ async function startServer(): Promise<void> {
     requireWorkspaceOwner,
     async (req: AuthenticatedRequest, res) => {
       try {
-        const ds = await getDatasourceWithSecret(String(req.params.dsId), req.user!.id);
+        const workspaceId = String(req.params.id);
+        const ds = await getDatasourceWithSecret(
+          String(req.params.dsId),
+          req.user!.id,
+          workspaceId,
+        );
         if (!ds) {
           res.status(404).json({ error: 'Datasource not found' });
           return;
@@ -600,16 +752,16 @@ async function startServer(): Promise<void> {
         const versionTag = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 12);
         const schemaSuffix = schemas && schemas.length > 0 ? ` [${schemas.join(', ')}]` : '';
         const snap = await createSnapshot({
-          workspaceId: String(req.params.id),
+          workspaceId,
           datasourceId: ds.id,
           versionTag,
           label: `${ds.name}${schemaSuffix} (${versionTag})`,
           schemaJson: graph,
         });
-        await updateWorkspaceMeta(String(req.params.id), { activeSnapshotId: snap.id });
+        await updateWorkspaceMeta(workspaceId, { activeSnapshotId: snap.id });
 
         await createCiRunRecord({
-          workspaceId: String(req.params.id),
+          workspaceId,
           branch: 'introspection',
           commitSha: versionTag.slice(-7),
           author: req.user!.name,
@@ -624,6 +776,13 @@ async function startServer(): Promise<void> {
               detail: `Discovered ${graph.nodes.length} objects and ${graph.relations.length} relations.`,
             },
           ],
+        });
+
+        void dispatchWorkspaceWebhooks(workspaceId, 'schema.diff.detected', {
+          datasourceId: ds.id,
+          datasourceName: ds.name,
+          snapshotId: snap.id,
+          objectCount: graph.nodes.length,
         });
 
         res.json({ snapshot: snap, objectCount: graph.nodes.length });
@@ -700,33 +859,24 @@ async function startServer(): Promise<void> {
           return;
         }
 
+        const workspaceId = String(req.params.id);
         const targetDsId =
           typeof req.body?.datasourceId === 'string' ? req.body.datasourceId : mig.datasourceId;
 
         if (targetDsId) {
-          const ds = await getDatasourceWithSecret(targetDsId, req.user!.id);
+          const ds = await getDatasourceWithSecret(targetDsId, req.user!.id, workspaceId);
           if (!ds) {
             res.status(404).json({ error: 'Target datasource not found' });
             return;
           }
-          validateDatasourceHost(ds.host);
-          const client = new pg.Client({
-            host: ds.host,
-            port: ds.port,
-            database: ds.databaseName,
-            user: ds.username,
-            password: ds.password,
-            connectionTimeoutMillis: 8000,
-            ssl: ds.sslMode === 'disable' ? false : { rejectUnauthorized: false },
-          });
+          const client = await connectPostgresClient(ds);
           try {
-            await client.connect();
             await client.query('BEGIN');
             await client.query(mig.upSql);
             await client.query('COMMIT');
           } catch (sqlErr) {
             await client.query('ROLLBACK').catch(() => undefined);
-            await updateMigrationStatus(mig.id, 'failed');
+            await updateMigrationStatus(workspaceId, mig.id, 'failed');
             const msg = sqlErr instanceof Error ? sqlErr.message : 'SQL execution failed';
             res.status(400).json({ error: msg });
             return;
@@ -735,7 +885,13 @@ async function startServer(): Promise<void> {
           }
         }
 
-        await updateMigrationStatus(mig.id, 'applied');
+        await updateMigrationStatus(workspaceId, mig.id, 'applied');
+        void dispatchWorkspaceWebhooks(workspaceId, 'migration.applied', {
+          migrationId: mig.id,
+          migrationName: mig.name,
+          version: mig.version,
+          datasourceId: targetDsId ?? null,
+        });
         res.json({ ok: true, status: 'applied' });
       } catch (err) {
         next(err);
@@ -835,7 +991,15 @@ async function startServer(): Promise<void> {
     requireWorkspaceOwner,
     async (req: AuthenticatedRequest, res, next) => {
       try {
-        await toggleWebhookRecord(String(req.params.whId), Boolean(req.body?.enabled));
+        const updated = await toggleWebhookRecord(
+          String(req.params.id),
+          String(req.params.whId),
+          Boolean(req.body?.enabled),
+        );
+        if (!updated) {
+          res.status(404).json({ error: 'Webhook not found' });
+          return;
+        }
         res.json({ ok: true });
       } catch (err) {
         next(err);
@@ -849,7 +1013,14 @@ async function startServer(): Promise<void> {
     requireWorkspaceOwner,
     async (req: AuthenticatedRequest, res, next) => {
       try {
-        await deleteWebhookRecord(String(req.params.whId));
+        const deleted = await deleteWebhookRecord(
+          String(req.params.id),
+          String(req.params.whId),
+        );
+        if (!deleted) {
+          res.status(404).json({ error: 'Webhook not found' });
+          return;
+        }
         res.json({ ok: true });
       } catch (err) {
         next(err);
@@ -889,7 +1060,14 @@ async function startServer(): Promise<void> {
     requireWorkspaceOwner,
     async (req: AuthenticatedRequest, res, next) => {
       try {
-        await deleteTagRecord(String(req.params.tagId));
+        const deleted = await deleteTagRecord(
+          String(req.params.id),
+          String(req.params.tagId),
+        );
+        if (!deleted) {
+          res.status(404).json({ error: 'Tag not found' });
+          return;
+        }
         res.json({ ok: true });
       } catch (err) {
         next(err);
@@ -924,9 +1102,20 @@ async function startServer(): Promise<void> {
   }
 
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, '0.0.0.0', () => {
+  const server = app.listen(port, '0.0.0.0', () => {
     console.log(`[DBLens] Server running on http://0.0.0.0:${port}`);
   });
+
+  const shutdown = (signal: string) => {
+    console.log(`[DBLens] Received ${signal}, shutting down gracefully...`);
+    server.close(async () => {
+      await closePrimaryDatabase();
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 8000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 startServer().catch((err) => {

@@ -1070,6 +1070,28 @@ export async function updateMigrationStatus(
   }
 }
 
+export async function deleteMigrationRecord(
+  workspaceId: string,
+  migrationId: string,
+): Promise<boolean> {
+  const db = getDb();
+  if (db) {
+    const deleted = await db
+      .delete(migrations)
+      .where(
+        and(eq(migrations.id, migrationId), eq(migrations.workspaceId, workspaceId)),
+      )
+      .returning({ id: migrations.id });
+    return deleted.length > 0;
+  }
+  const idx = mem.migrations.findIndex(
+    (m) => m.id === migrationId && m.workspaceId === workspaceId,
+  );
+  if (idx === -1) return false;
+  mem.migrations.splice(idx, 1);
+  return true;
+}
+
 export async function createCiRunRecord(input: Omit<CiRunDTO, 'id' | 'createdAt'>): Promise<CiRunDTO> {
   const id = newId('ci');
   const now = new Date();
@@ -1135,6 +1157,36 @@ export async function createWebhookRecord(input: {
     lastTriggeredAt: null,
     createdAt: now.toISOString(),
   };
+}
+
+export async function getWebhookById(
+  workspaceId: string,
+  webhookId: string,
+): Promise<WebhookDTO | null> {
+  const db = getDb();
+  if (db) {
+    const rows = await db
+      .select()
+      .from(webhooks)
+      .where(and(eq(webhooks.id, webhookId), eq(webhooks.workspaceId, workspaceId)));
+    const w = rows[0];
+    if (!w) return null;
+    return {
+      id: w.id,
+      workspaceId: w.workspaceId,
+      name: w.name,
+      url: w.url,
+      events: w.events,
+      enabled: w.enabled,
+      lastTriggeredAt: w.lastTriggeredAt?.toISOString() ?? null,
+      createdAt: w.createdAt.toISOString(),
+    };
+  }
+  return (
+    mem.webhooks.find(
+      (w) => w.id === webhookId && w.workspaceId === workspaceId,
+    ) ?? null
+  );
 }
 
 export async function toggleWebhookRecord(

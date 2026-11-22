@@ -3,6 +3,7 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import path from 'node:path';
 import fs from 'node:fs';
 import net from 'node:net';
+import crypto from 'node:crypto';
 import {
   initDatabaseFromEnv,
   connectPrimaryDatabase,
@@ -32,8 +33,10 @@ import {
   deleteDatasource,
   createMigrationRecord,
   updateMigrationStatus,
+  deleteMigrationRecord,
   createCiRunRecord,
   createWebhookRecord,
+  getWebhookById,
   toggleWebhookRecord,
   deleteWebhookRecord,
   listEnabledWebhooksForEvent,
@@ -900,55 +903,279 @@ async function startServer(): Promise<void> {
   );
 
   app.post(
+    '/api/workspaces/:id/migrations/:migId/dry-run',
+    requireAuth,
+    requireWorkspaceOwner,
+    async (req: AuthenticatedRequest, res, next) => {
+      try {
+        const workspaceId = String(req.params.id);
+        const bundle = await getWorkspaceBundle(workspaceId, req.user!.id);
+        const mig = bundle?.migrations.find((m) => m.id === String(req.params.migId));
+        if (!mig) {
+          res.status(404).json({ error: 'Migration not found' });
+          return;
+        }
+        const targetDsId =
+          typeof req.body?.datasourceId === 'string' ? req.body.datasourceId : mig.datasourceId;
+        if (!targetDsId) {
+          res.status(400).json({ error: 'Select a target PostgreSQL datasource to run a live SQL dry-run.' });
+          return;
+        }
+        const ds = await getDatasourceWithSecret(targetDsId, req.user!.id, workspaceId);
+        if (!ds) {
+          res.status(404).json({ error: 'Target datasource not found' });
+          return;
+        }
+        const started = Date.now();
+        const client = await connectPostgresClient(ds);
+        try {
+          await client.query('BEGIN');
+          await client.query(mig.upSql);
+          await client.query('ROLLBACK');
+          res.json({ ok: true, latencyMs: Date.now() - started });
+        } catch (sqlErr) {
+          await client.query('ROLLBACK').catch(() => undefined);
+          const msg = sqlErr instanceof Error ? sqlErr.message : 'Dry-run validation failed';
+          res.status(400).json({ ok: false, error: msg });
+        } finally {
+          await client.end().catch(() => undefined);
+        }
+      } catch (err) {
+        if (err instanceof CredentialDecryptionError) {
+          res.status(409).json({ ok: false, code: 'CREDENTIALS_NEED_UPDATE', error: err.message });
+          return;
+        }
+        next(err);
+      }
+    },
+  );
+
+  app.post(
+    '/api/workspaces/:id/migrations/:migId/rollback',
+    requireAuth,
+    requireWorkspaceOwner,
+    async (req: AuthenticatedRequest, res, next) => {
+      try {
+        const workspaceId = String(req.params.id);
+        const bundle = await getWorkspaceBundle(workspaceId, req.user!.id);
+        const mig = bundle?.migrations.find((m) => m.id === String(req.params.migId));
+        if (!mig) {
+          res.status(404).json({ error: 'Migration not found' });
+          return;
+        }
+        if (!mig.downSql.trim()) {
+          res.status(400).json({ error: 'This migration has no reversible Down SQL.' });
+          return;
+        }
+        const targetDsId =
+          typeof req.body?.datasourceId === 'string' ? req.body.datasourceId : mig.datasourceId;
+
+        if (targetDsId) {
+          const ds = await getDatasourceWithSecret(targetDsId, req.user!.id, workspaceId);
+          if (!ds) {
+            res.status(404).json({ error: 'Target datasource not found' });
+            return;
+          }
+          const client = await connectPostgresClient(ds);
+          try {
+            await client.query('BEGIN');
+            await client.query(mig.downSql);
+            await client.query('COMMIT');
+          } catch (sqlErr) {
+            await client.query('ROLLBACK').catch(() => undefined);
+            const msg = sqlErr instanceof Error ? sqlErr.message : 'Rollback SQL failed';
+            res.status(400).json({ error: msg });
+            return;
+          } finally {
+            await client.end().catch(() => undefined);
+          }
+        }
+
+        await updateMigrationStatus(workspaceId, mig.id, 'pending');
+        void dispatchWorkspaceWebhooks(workspaceId, 'migration.rolled_back', {
+          migrationId: mig.id,
+          migrationName: mig.name,
+          version: mig.version,
+          datasourceId: targetDsId ?? null,
+        });
+        res.json({ ok: true, status: 'pending' });
+      } catch (err) {
+        if (err instanceof CredentialDecryptionError) {
+          res.status(409).json({ ok: false, code: 'CREDENTIALS_NEED_UPDATE', error: err.message });
+          return;
+        }
+        next(err);
+      }
+    },
+  );
+
+  app.delete(
+    '/api/workspaces/:id/migrations/:migId',
+    requireAuth,
+    requireWorkspaceOwner,
+    async (req: AuthenticatedRequest, res, next) => {
+      try {
+        const deleted = await deleteMigrationRecord(
+          String(req.params.id),
+          String(req.params.migId),
+        );
+        if (!deleted) {
+          res.status(404).json({ error: 'Migration not found' });
+          return;
+        }
+        res.json({ ok: true });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
+
+  app.post(
     '/api/workspaces/:id/ci-runs',
     requireAuth,
     requireWorkspaceOwner,
     async (req: AuthenticatedRequest, res, next) => {
       try {
+        const started = Date.now();
         const bundle = await getWorkspaceBundle(String(req.params.id), req.user!.id);
         if (!bundle) {
           res.status(404).json({ error: 'Workspace not found' });
           return;
         }
-        const fromSnap = bundle.snapshots.find(
-          (s) => s.id === bundle.workspace.baselineSnapshotId,
-        );
-        const toSnap = bundle.snapshots.find(
-          (s) => s.id === bundle.workspace.activeSnapshotId,
-        );
+        const fromId =
+          typeof req.body?.fromSnapshotId === 'string' && req.body.fromSnapshotId
+            ? req.body.fromSnapshotId
+            : bundle.workspace.baselineSnapshotId;
+        const toId =
+          typeof req.body?.toSnapshotId === 'string' && req.body.toSnapshotId
+            ? req.body.toSnapshotId
+            : bundle.workspace.activeSnapshotId;
+
+        const fromSnap = bundle.snapshots.find((s) => s.id === fromId);
+        const toSnap = bundle.snapshots.find((s) => s.id === toId);
         const diff =
           fromSnap && toSnap
             ? computeSchemaDiff(fromSnap.schemaJson, toSnap.schemaJson)
             : null;
-        const destructive = diff?.sqlPlan.some(
-          (s) => s.action === 'DROP COLUMN' || s.action === 'DROP TABLE',
+        const targetGraph = toSnap?.schemaJson ?? { dialect: 'postgresql', nodes: [], relations: [] };
+
+        // 1. Destructive Change Guard
+        const dropSteps =
+          diff?.sqlPlan.filter(
+            (s) => s.action === 'DROP COLUMN' || s.action === 'DROP TABLE' || s.action === 'DROP VIEW',
+          ) ?? [];
+        const destructive = dropSteps.length > 0;
+
+        // 2. Lock & Backfill Safety (NOT NULL ADD COLUMN without DEFAULT, or ACCESS EXCLUSIVE)
+        const unsafeNotNull =
+          diff?.sqlPlan.filter(
+            (s) =>
+              s.action === 'ADD COLUMN' &&
+              s.statement.includes('NOT NULL') &&
+              !s.statement.includes('DEFAULT'),
+          ) ?? [];
+        const exclusiveLocks =
+          diff?.sqlPlan.filter((s) => s.lockLevel === 'ACCESS EXCLUSIVE') ?? [];
+
+        // 3. Primary Key & Relation Integrity across target schema
+        const tablesMissingPk = targetGraph.nodes.filter(
+          (n) => n.kind === 'table' && !n.columns.some((c) => c.isPrimaryKey),
         );
+        const nodeIds = new Set(targetGraph.nodes.map((n) => n.id));
+        const brokenRelations = targetGraph.relations.filter(
+          (r) => !nodeIds.has(r.sourceId) || !nodeIds.has(r.targetId),
+        );
+
+        // 4. View Dependency Check
+        const existingKeys = new Set(
+          targetGraph.nodes.map((n) => `${n.schema || 'public'}.${n.name}`),
+        );
+        const viewNodes = targetGraph.nodes.filter((n) => n.kind === 'view');
+        const brokenViewDeps = viewNodes.filter((v) =>
+          (v.dependencies ?? []).some((dep) => {
+            const cleanDep = dep.includes('.') ? dep : `public.${dep}`;
+            return !existingKeys.has(cleanDep) && !existingKeys.has(dep);
+          }),
+        );
+
+        const checks: { name: string; status: 'passed' | 'warning' | 'failed'; detail: string }[] = [
+          {
+            name: 'Destructive Change Guard',
+            status: destructive ? 'warning' : 'passed',
+            detail: destructive
+              ? `${dropSteps.length} drop statement(s): ${dropSteps.map((s) => s.target).join(', ')}`
+              : 'No DROP TABLE, DROP VIEW, or DROP COLUMN statements found.',
+          },
+          {
+            name: 'PostgreSQL Lock & Backfill Safety',
+            status: unsafeNotNull.length > 0 ? 'failed' : exclusiveLocks.length > 0 ? 'warning' : 'passed',
+            detail:
+              unsafeNotNull.length > 0
+                ? `${unsafeNotNull.length} ADD COLUMN NOT NULL without DEFAULT (will fail on non-empty tables): ${unsafeNotNull.map((s) => s.target).join(', ')}`
+                : exclusiveLocks.length > 0
+                  ? `${exclusiveLocks.length} statement(s) require ACCESS EXCLUSIVE lock.`
+                  : 'All DDL changes avoid blocking table rewrites.',
+          },
+          {
+            name: 'Primary Key & FK Integrity',
+            status: brokenRelations.length > 0 ? 'failed' : tablesMissingPk.length > 0 ? 'warning' : 'passed',
+            detail:
+              brokenRelations.length > 0
+                ? `${brokenRelations.length} dangling relation(s) reference missing tables.`
+                : tablesMissingPk.length > 0
+                  ? `${tablesMissingPk.length} table(s) have no Primary Key: ${tablesMissingPk.map((t) => t.name).join(', ')}`
+                  : `All ${targetGraph.nodes.filter((n) => n.kind === 'table').length} tables and ${targetGraph.relations.length} relations verified.`,
+          },
+          {
+            name: 'View Dependency Check',
+            status: brokenViewDeps.length > 0 ? 'warning' : 'passed',
+            detail:
+              brokenViewDeps.length > 0
+                ? `Unresolved dependencies in view(s): ${brokenViewDeps.map((v) => v.name).join(', ')}`
+                : `${viewNodes.length} view(s) verified against active schema objects.`,
+          },
+        ];
+
+        const hasFailed = checks.some((c) => c.status === 'failed');
+        const hasWarning = checks.some((c) => c.status === 'warning');
+        const overallStatus: 'passed' | 'warning' | 'failed' = hasFailed
+          ? 'failed'
+          : hasWarning
+            ? 'warning'
+            : 'passed';
+
+        const commitSha = crypto
+          .createHash('sha256')
+          .update(`${fromId}:${toId}:${diff?.upSql || ''}`)
+          .digest('hex')
+          .slice(0, 7);
+
+        const summary = hasFailed
+          ? `${checks.filter((c) => c.status === 'failed').length} blocking schema lint error(s) detected`
+          : hasWarning
+            ? `${diff?.sqlPlan.length ?? 0} plan step(s) validated with warnings`
+            : `${diff?.sqlPlan.length ?? 0} schema plan step(s) passed all 4 lint checks`;
+
         const run = await createCiRunRecord({
           workspaceId: bundle.workspace.id,
-          branch: typeof req.body?.branch === 'string' ? req.body.branch : 'main',
-          commitSha: Math.random().toString(16).slice(2, 9),
+          branch: typeof req.body?.branch === 'string' && req.body.branch.trim() ? req.body.branch.trim() : 'main',
+          commitSha,
           author: req.user!.name,
-          status: destructive ? 'warning' : 'passed',
-          summary: destructive
-            ? 'Destructive DROP operation detected; manual review advised'
-            : `${diff?.sqlPlan.length ?? 0} schema plan step(s) validated`,
+          status: overallStatus,
+          summary,
           diffCount: diff?.sqlPlan.length ?? 0,
-          durationMs: 650,
-          checks: [
-            {
-              name: 'Destructive Change Guard',
-              status: destructive ? 'warning' : 'passed',
-              detail: destructive
-                ? 'Contains DROP TABLE or DROP COLUMN.'
-                : 'No destructive drops found.',
-            },
-            {
-              name: 'PostgreSQL Lock Safety',
-              status: 'passed',
-              detail: 'Lock levels computed for all DDL statements.',
-            },
-          ],
+          durationMs: Math.max(1, Date.now() - started),
+          checks,
         });
+
+        void dispatchWorkspaceWebhooks(bundle.workspace.id, 'ci.run.completed', {
+          ciRunId: run.id,
+          branch: run.branch,
+          status: run.status,
+          summary: run.summary,
+          diffCount: run.diffCount,
+        });
+
         res.status(201).json({ ciRun: run });
       } catch (err) {
         next(err);
@@ -964,9 +1191,9 @@ async function startServer(): Promise<void> {
       try {
         const name = String(req.body?.name || '').trim();
         const url = validateWebhookUrl(String(req.body?.url || '').trim());
-        const events = Array.isArray(req.body?.events)
+        const events = Array.isArray(req.body?.events) && req.body.events.length > 0
           ? req.body.events.map(String)
-          : ['schema.diff.detected'];
+          : ['schema.diff.detected', 'migration.applied'];
         if (!name) {
           res.status(400).json({ error: 'Webhook name is required' });
           return;
@@ -981,6 +1208,52 @@ async function startServer(): Promise<void> {
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Invalid webhook configuration';
         res.status(400).json({ error: msg });
+      }
+    },
+  );
+
+  app.post(
+    '/api/workspaces/:id/webhooks/:whId/test',
+    requireAuth,
+    requireWorkspaceOwner,
+    async (req: AuthenticatedRequest, res) => {
+      try {
+        const workspaceId = String(req.params.id);
+        const wh = await getWebhookById(workspaceId, String(req.params.whId));
+        if (!wh) {
+          res.status(404).json({ error: 'Webhook not found' });
+          return;
+        }
+        const safeUrl = validateWebhookUrl(wh.url);
+        const started = Date.now();
+        const response = await fetch(safeUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-DBLens-Event': 'webhook.test',
+          },
+          body: JSON.stringify({
+            event: 'webhook.test',
+            workspaceId,
+            webhookName: wh.name,
+            timestamp: new Date().toISOString(),
+            message: 'DBLens test delivery ping',
+          }),
+          signal: AbortSignal.timeout(6000),
+        });
+        const latencyMs = Date.now() - started;
+        if (response.ok) {
+          await markWebhookTriggered(wh.id);
+        }
+        res.json({
+          ok: response.ok,
+          status: response.status,
+          statusText: response.statusText,
+          latencyMs,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Webhook test delivery failed';
+        res.status(400).json({ ok: false, error: msg });
       }
     },
   );
@@ -1034,18 +1307,24 @@ async function startServer(): Promise<void> {
     requireWorkspaceOwner,
     async (req: AuthenticatedRequest, res, next) => {
       try {
+        const workspaceId = String(req.params.id);
         const name = String(req.body?.name || '').trim();
         if (!name) {
           res.status(400).json({ error: 'Tag name is required' });
           return;
         }
         const tag = await createTagRecord({
-          workspaceId: String(req.params.id),
+          workspaceId,
           name,
           color: typeof req.body?.color === 'string' ? req.body.color : '#2563EB',
           targetSnapshotId:
             typeof req.body?.targetSnapshotId === 'string' ? req.body.targetSnapshotId : null,
           description: typeof req.body?.description === 'string' ? req.body.description : '',
+        });
+        void dispatchWorkspaceWebhooks(workspaceId, 'tag.created', {
+          tagId: tag.id,
+          name: tag.name,
+          targetSnapshotId: tag.targetSnapshotId,
         });
         res.status(201).json({ tag });
       } catch (err) {

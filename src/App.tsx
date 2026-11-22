@@ -360,13 +360,18 @@ export default function App() {
     });
   };
 
-  const handleCreateMigration = async (name: string, upSql: string, downSql: string) => {
+  const handleCreateMigration = async (
+    name: string,
+    upSql: string,
+    downSql: string,
+    datasourceId?: string,
+  ) => {
     if (!bundle) return;
     if (!requireAuthenticated()) return;
     try {
       await apiFetch(`/api/workspaces/${bundle.workspace.id}/migrations`, {
         method: 'POST',
-        body: JSON.stringify({ name, upSql, downSql }),
+        body: JSON.stringify({ name, upSql, downSql, datasourceId }),
       });
       await loadWorkspaceBundle(bundle.workspace.id);
       setPrimaryTab('migrations');
@@ -574,18 +579,34 @@ export default function App() {
         )}
 
         {primaryTab === 'docs' && (
-          <DocsView graph={activeGraph} workspace={bundle.workspace} />
+          <DocsView
+            graph={activeGraph}
+            workspace={bundle.workspace}
+            onOpenInErd={(nodeId) => {
+              setSelectedNodeId(nodeId);
+              setSchemaFilter('ALL');
+              setPrimaryTab('overview');
+              setOverviewSubTab('erd');
+            }}
+          />
         )}
 
         {primaryTab === 'ci-runs' && (
           <CiRunsView
             ciRuns={bundle.ciRuns}
-            onTriggerRun={async (branch) => {
+            snapshots={bundle.snapshots}
+            defaultFromSnapshotId={fromSnapshotId || bundle.workspace.baselineSnapshotId}
+            defaultToSnapshotId={toSnapshotId || bundle.workspace.activeSnapshotId}
+            onTriggerRun={async (branch, fromSnapId, toSnapId) => {
               if (!requireAuthenticated()) return;
               try {
                 await apiFetch(`/api/workspaces/${bundle.workspace.id}/ci-runs`, {
                   method: 'POST',
-                  body: JSON.stringify({ branch }),
+                  body: JSON.stringify({
+                    branch,
+                    fromSnapshotId: fromSnapId,
+                    toSnapshotId: toSnapId,
+                  }),
                 });
                 await loadWorkspaceBundle(bundle.workspace.id);
                 showToast('Schema CI lint run completed');
@@ -603,6 +624,26 @@ export default function App() {
           <MigrationsView
             migrations={bundle.migrations}
             datasources={bundle.datasources}
+            onCreateMigration={handleCreateMigration}
+            onDryRunMigration={async (migId, datasourceId) => {
+              if (!requireAuthenticated()) {
+                return { ok: false, error: 'Sign in required to run live SQL dry-run.' };
+              }
+              try {
+                return await apiFetch<{ ok: boolean; latencyMs?: number; error?: string }>(
+                  `/api/workspaces/${bundle.workspace.id}/migrations/${migId}/dry-run`,
+                  {
+                    method: 'POST',
+                    body: JSON.stringify({ datasourceId }),
+                  },
+                );
+              } catch (err) {
+                return {
+                  ok: false,
+                  error: err instanceof Error ? err.message : 'Dry-run validation failed',
+                };
+              }
+            }}
             onApplyMigration={async (migId, datasourceId) => {
               if (!requireAuthenticated()) return;
               try {
@@ -619,6 +660,42 @@ export default function App() {
               } catch (err) {
                 showToast(
                   err instanceof Error ? err.message : 'Migration failed',
+                  true,
+                );
+              }
+            }}
+            onRollbackMigration={async (migId, datasourceId) => {
+              if (!requireAuthenticated()) return;
+              try {
+                await apiFetch(
+                  `/api/workspaces/${bundle.workspace.id}/migrations/${migId}/rollback`,
+                  {
+                    method: 'POST',
+                    body: JSON.stringify({ datasourceId }),
+                  },
+                );
+                await loadWorkspaceBundle(bundle.workspace.id);
+                showToast('Migration rolled back');
+                pushNotification('Rolled back migration');
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Rollback failed',
+                  true,
+                );
+              }
+            }}
+            onDeleteMigration={async (migId) => {
+              if (!requireAuthenticated()) return;
+              try {
+                await apiFetch(
+                  `/api/workspaces/${bundle.workspace.id}/migrations/${migId}`,
+                  { method: 'DELETE' },
+                );
+                await loadWorkspaceBundle(bundle.workspace.id);
+                showToast('Migration deleted');
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Failed to delete migration',
                   true,
                 );
               }
@@ -664,6 +741,31 @@ export default function App() {
                   err instanceof Error ? err.message : 'Failed to toggle webhook',
                   true,
                 );
+              }
+            }}
+            onTestWebhook={async (whId) => {
+              if (!requireAuthenticated()) {
+                return { ok: false, error: 'Sign in required' };
+              }
+              try {
+                const res = await apiFetch<{
+                  ok: boolean;
+                  status?: number;
+                  statusText?: string;
+                  latencyMs?: number;
+                  error?: string;
+                }>(`/api/workspaces/${bundle.workspace.id}/webhooks/${whId}/test`, {
+                  method: 'POST',
+                });
+                if (res.ok) {
+                  await loadWorkspaceBundle(bundle.workspace.id);
+                }
+                return res;
+              } catch (err) {
+                return {
+                  ok: false,
+                  error: err instanceof Error ? err.message : 'Test request failed',
+                };
               }
             }}
             onDeleteWebhook={async (whId) => {
@@ -722,6 +824,15 @@ export default function App() {
                   true,
                 );
               }
+            }}
+            onSelectSnapshot={(snapId) => {
+              setToSnapshotId(snapId);
+              setDraftGraph(null);
+              setHasUnsavedEdits(false);
+              setSchemaFilter('ALL');
+              setSelectedNodeId(null);
+              setPrimaryTab('overview');
+              setOverviewSubTab('erd');
             }}
           />
         )}

@@ -27,31 +27,31 @@
 <table>
   <tr>
     <td width="33.33%" align="center">
-      <img src="docs/screen_dblens_5.png" alt="Schema Reference Documentation" width="100%" />
+      <img src="docs/screen_dblens_2.png" alt="Schema Reference Documentation" width="100%" />
       <br />
-      <sub><strong>Schema Docs</strong> — Column types, PK/FK keys &amp; Markdown export</sub>
+      <sub><strong>Schema Docs</strong> — Search, Copy DDL, Indexes, ERD jump &amp; Markdown export</sub>
     </td>
     <td width="33.33%" align="center">
-      <img src="docs/screen_dblens_4.png" alt="Automated Schema CI Runs" width="100%" />
+      <img src="docs/screen_dblens_3.png" alt="Automated Schema CI Runs" width="100%" />
       <br />
-      <sub><strong>CI Runs</strong> — Catalog scans, destructive guards &amp; dry-runs</sub>
+      <sub><strong>CI Runs</strong> — Snapshot transition lint, lock safety &amp; FK/view checks</sub>
     </td>
     <td width="33.33%" align="center">
-      <img src="docs/screen_dblens_2.png" alt="Versioned SQL Migrations Ledger" width="100%" />
+      <img src="docs/screen_dblens_4.png" alt="Versioned SQL Migrations Ledger" width="100%" />
       <br />
-      <sub><strong>Migrations</strong> — Versioned Up/Down SQL &amp; live execution</sub>
+      <sub><strong>Migrations</strong> — Manual/diff SQL, live PostgreSQL dry-run, apply &amp; rollback</sub>
     </td>
   </tr>
   <tr>
     <td width="33.33%" align="center">
-      <img src="docs/screen_dblens_3.png" alt="Schema Drift Webhooks" width="100%" />
+      <img src="docs/screen_dblens_5.png" alt="Schema Drift Webhooks" width="100%" />
       <br />
-      <sub><strong>Webhooks</strong> — Event alerts on schema diffs &amp; migrations</sub>
+      <sub><strong>Webhooks</strong> — Multi-event HTTP POST alerts &amp; live test ping</sub>
     </td>
     <td width="33.33%" align="center">
       <img src="docs/screen_dblens_6.png" alt="Immutable Snapshot Release Tags" width="100%" />
       <br />
-      <sub><strong>Release Tags</strong> — Pin semantic versions to schema snapshots</sub>
+      <sub><strong>Release Tags</strong> — Color-coded snapshot pins &amp; one-click Open in ERD</sub>
     </td>
     <td width="33.33%" align="center">
       <img src="docs/screen_dblens_7.png" alt="PostgreSQL Datasource Settings" width="100%" />

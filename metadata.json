@@ -1,0 +1,6 @@
+{
+  "name": "DBLens",
+  "description": "Database schema visualizer, interactive ERD builder, and SQL/HCL migration & schema diff tool powered by PostgreSQL and Drizzle ORM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
